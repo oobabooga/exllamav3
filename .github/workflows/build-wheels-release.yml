@@ -22,10 +22,10 @@ jobs:
 
         # Ubuntu 20.04 CUDA
          - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.12', cuda: '12.6.3', rocm:    '', torch: '2.6.0', cudaarch: '8.0 8.6 8.9 9.0+PTX' }
-        
+
         # Windows 2022 CUDA
          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.6.3', rocm:    '', torch: '2.6.0', cudaarch: '8.0 8.6 8.9 9.0+PTX' }
-        
+
          # sdist
          - { artname: 'sdist', os: ubuntu-20.04, pyver: '3.12', cuda: '',       rocm:    '', torch: '2.6.0', cudaarch: ''                                    }
 
@@ -59,9 +59,9 @@ jobs:
 
       - name: Get version string
         id: package_version
-        run: | 
+        run: |
           $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') 
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"')
           {
             Write-Output $('::notice file=build-wheels-release.yml,line=200,title=Package Version::Detected package version is: {0}' -f $Matches[1])
             Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
@@ -93,7 +93,7 @@ jobs:
           wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION focal main" | sudo tee --append /etc/apt/sources.list.d/rocm.list
           echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
-          
+
           sudo apt update
           sudo apt install rocm-hip-sdk -y
           sudo apt clean -y
@@ -110,7 +110,7 @@ jobs:
           pip3 install --upgrade setuptools==69.5.1 build wheel safetensors sentencepiece ninja
           pip3 cache purge
 
-          # --- Build wheel 
+          # --- Build wheel
 
           python3 -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=+rocm${{ matrix.rocm }}-torch${{ matrix.torch }}"
 
@@ -135,7 +135,7 @@ jobs:
             Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
             $env:DISTUTILS_USE_SDK=1
           }
-  
+
           # --- Install CUDA using Conda
           $cudaVersion = '${{ matrix.cuda }}'
           $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
@@ -148,30 +148,23 @@ jobs:
 
           $env:CUDA_PATH = $env:CONDA_PREFIX
           $env:CUDA_HOME = $env:CONDA_PREFIX
+          $env:CUDA_TOOLKIT_ROOT_DIR = $env:CUDA_HOME
           if ($IsLinux) {$env:LD_LIBRARY_PATH = $env:CONDA_PREFIX + '/lib:' + $env:LD_LIBRARY_PATH}
-          
+          if ($IsLinux) {$env:LD_LIBRARY_PATH = $env:CUDA_HOME + '/extras/CUPTI/lib64:' + $env:LD_LIBRARY_PATH}
+          if ($IsLinux) {$env:LIBRARY_PATH = $env:CUDA_HOME + '/lib64:' + $env:LIBRARY_PATH}
+          if ($IsLinux) {$env:LD_LIBRARY_PATH = $env:CUDA_HOME + '/lib64:' + $env:LD_LIBRARY_PATH}
+          if ($IsLinux) {$env:CFLAGS = '-I' + $env:CUDA_HOME + '/include ' + $env:CFLAGS}
+
           # --- Install dependencies
-          
+
           python -m ensurepip --upgrade
           python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cu$cudaVersionPytorch
           python -m pip install --upgrade setuptools==69.5.1 build wheel safetensors sentencepiece ninja
 
           # --- Build wheel
-                  
+
           $BUILDTAG = "+cu$cudaVersionPytorch-torch${{ matrix.torch }}"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
-
-          # Add CUDA include directories to compiler path
-          if ($IsLinux) {
-            $env:CPATH = "$env:CONDA_PREFIX/include:$env:CPATH"
-            $env:C_INCLUDE_PATH = "$env:CONDA_PREFIX/include:$env:C_INCLUDE_PATH"
-            $env:CPLUS_INCLUDE_PATH = "$env:CONDA_PREFIX/include:$env:CPLUS_INCLUDE_PATH"
-          }
-          else {
-            $env:CPATH = "$env:CONDA_PREFIX\include;$env:CPATH"
-            $env:C_INCLUDE_PATH = "$env:CONDA_PREFIX\include;$env:C_INCLUDE_PATH"
-            $env:CPLUS_INCLUDE_PATH = "$env:CONDA_PREFIX\include;$env:CPLUS_INCLUDE_PATH"
-          }
 
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
 
@@ -188,12 +181,12 @@ jobs:
           }
 
           # --- Install dependencies
-          
+
           python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
           python -m pip install build wheel ninja
 
           # --- Build wheel
-           
+
           $env:EXLLAMA_NOCOMPILE=1
           python -m build -n
 
