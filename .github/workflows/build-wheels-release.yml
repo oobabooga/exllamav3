@@ -160,6 +160,19 @@ jobs:
                   
           $BUILDTAG = "+cu$cudaVersionPytorch-torch${{ matrix.torch }}"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+
+          # Add CUDA include directories to compiler path
+          if ($IsLinux) {
+            $env:CPATH = "$env:CONDA_PREFIX/include:$env:CPATH"
+            $env:C_INCLUDE_PATH = "$env:CONDA_PREFIX/include:$env:C_INCLUDE_PATH"
+            $env:CPLUS_INCLUDE_PATH = "$env:CONDA_PREFIX/include:$env:CPLUS_INCLUDE_PATH"
+          }
+          else {
+            $env:CPATH = "$env:CONDA_PREFIX\include;$env:CPATH"
+            $env:C_INCLUDE_PATH = "$env:CONDA_PREFIX\include;$env:C_INCLUDE_PATH"
+            $env:CPLUS_INCLUDE_PATH = "$env:CONDA_PREFIX\include;$env:CPLUS_INCLUDE_PATH"
+          }
+
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
 
       # Build sdist
