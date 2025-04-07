@@ -21,10 +21,10 @@ jobs:
         include:
 
         # Ubuntu 20.04 CUDA
-         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.12', cuda: '12.6.3', rocm:    '', torch: '2.6.0', cudaarch: '7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.12', cuda: '12.6.3', rocm:    '', torch: '2.6.0', cudaarch: '8.0 8.6 8.9 9.0+PTX' }
         
         # Windows 2022 CUDA
-         - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.6.3', rocm:    '', torch: '2.6.0', cudaarch: '7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+         - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.6.3', rocm:    '', torch: '2.6.0', cudaarch: '8.0 8.6 8.9 9.0+PTX' }
         
         # Ubuntu 20.04 ROCm
          - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.12', cuda: '',       rocm: '6.1', torch: '2.6.0', cudaarch: ''                                    }
