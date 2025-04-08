@@ -124,9 +124,7 @@ jobs:
         with:
           activate-environment: "exllama"
           python-version: ${{ matrix.pyver }}
-#          miniforge-variant: Mambaforge
           miniforge-version: latest
-#          use-mamba: true
           add-pip-as-python-dependency: true
           auto-activate-base: false
 
