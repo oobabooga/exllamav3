@@ -87,7 +87,6 @@ setup(
     author="turboderp",
     install_requires=[
         "tokenizers>=0.21.1",
-        "numpy>=2.1.0",
         "rich",
         "typing_extensions",
         "ninja",
