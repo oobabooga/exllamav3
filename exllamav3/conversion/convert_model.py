@@ -7,7 +7,7 @@ from ..modules import Linear
 from ..modules.quant import LinearFP16
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
-from ..util import Timer
+from ..util import Timer, human_time
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
 from safetensors.torch import save_file
@@ -30,6 +30,7 @@ parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data si
 parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 60, help = "Minimum checkpoint interval, in seconds")
 parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
 parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mode")
+parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 
 num_ref_states = 5
 
@@ -129,6 +130,7 @@ def prepare(args) -> (dict, bool, str, str):
         ("cal_cols", False, 2048),
         ("checkpoint_interval", True, None),
         ("last_checkpoint_index", True, -1),
+        ("devices", True, None),
     ]:
         override(arg_, can_override, default)
 
@@ -196,7 +198,8 @@ def main(args, job_state):
     torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
     torch.set_grad_enabled(False)
-    device = torch.device("cuda:0")
+    devices = [int(d) for d in args["devices"].split(",")]
+    device = torch.device(devices[0])
     last_checkpoint_time = time.time()
 
     # Get model
@@ -207,6 +210,8 @@ def main(args, job_state):
 
     # Iterate over modules
     for idx, module in enumerate(model.modules):
+
+        start_module_time = time.time()
 
         # If resuming, skip along to checkpoint index
         if idx < job_state["next_module_idx"]:
@@ -273,6 +278,7 @@ def main(args, job_state):
             quant_args = {
                 "seed": idx,
                 "K": strategy[linear.key],
+                "devices": devices,
             }
             with Timer() as t:
                 proxy_err = linear.convert_exl3(
@@ -283,7 +289,7 @@ def main(args, job_state):
                 )
             print(
                 f" -- Quantized: {linear.key:{config.stc.max_key_len()}}"
-                f"  bpw: {quant_args['K']:.2f}"
+                f"  bpw: {quant_args['K']:5.2f}"
                 f"  proxy_err: {proxy_err:8.6f}"
                 f"  [{t.interval:4.2f} s]"
             )
@@ -299,13 +305,9 @@ def main(args, job_state):
         num_bytes = dsize(tensors)
         num_bits = num_bytes * 8
         final_bpw = num_bits / module.weights_numel()
-        print(
-            f" -- Quantized: {module.key:{config.stc.max_key_len()}}"
-            f"  bpw: {final_bpw:.2f}"
-        )
 
         del tensors
-        free_mem()
+        # free_mem()
 
         # Advance state
         error = 0
@@ -323,12 +325,23 @@ def main(args, job_state):
                     error += get_state_error(state[i], ref_states[i])
                     ref_states[i] = None
         error /= num_ref_states
-        print(f" -- Finished module: {module.key}, rfn: {error:.6f}")
+
+        # Feedback after module
+        module_time = time.time() - start_module_time
+        print(
+            f" -- Quantized: {module.key:47}"
+            f"  bpw: {final_bpw:5.2f}"
+            f"        rfn: {error:.6f}"
+            f"  [{module_time:.2f} s]"
+        )
         sys.stdout.flush()
+        if idx >= 1:
+            est_remaining = module_time * (len(model.modules) - idx - 1)
+            print(f" -- Estimated remaining time: {human_time(est_remaining)}")
 
         # Unload current module
         module.unload()
-        free_mem()
+        # free_mem()
 
         # Checkpoint
         job_state["next_module_idx"] = idx + 1
