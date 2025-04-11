@@ -190,9 +190,9 @@ jobs:
 
       - name: Extract version
         run: |
-          # This regex handles alpha/beta versions
-          VERSION=$(grep -oP "__version__ = ['\"]?\K[^'\"]*" exllamav3/version.py)
-          echo "PKG_VERSION=$VERSION" >> $GITHUB_ENV
+          $version = Select-String -Path "exllamav3/version.py" -Pattern "__version__ = ['\"](.+)['\"]" | ForEach-Object { $_.Matches.Groups[1].Value }
+          echo "PKG_VERSION=$version" >> $env:GITHUB_ENV
+        shell: pwsh
 
       - uses: actions/upload-artifact@v4
         if: matrix.artname == 'wheel'
