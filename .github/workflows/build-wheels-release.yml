@@ -188,6 +188,12 @@ jobs:
 
       # Upload files
 
+      - name: Extract version
+        run: |
+          # This regex handles alpha/beta versions
+          VERSION=$(grep -oP "__version__ = ['\"]?\K[^'\"]*" exllamav3/version.py)
+          echo "PKG_VERSION=$VERSION" >> $GITHUB_ENV
+
       - uses: actions/upload-artifact@v4
         if: matrix.artname == 'wheel'
         with:
