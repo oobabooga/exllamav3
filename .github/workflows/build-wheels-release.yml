@@ -63,7 +63,7 @@ jobs:
         id: package_version
         run: |
           $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"')
+          if ($versionString -match '__version__ = "([\d\.]+(?:a|b|rc|dev)?\d*)"')
           {
             Write-Output $('::notice file=build-wheels-release.yml,line=200,title=Package Version::Detected package version is: {0}' -f $Matches[1])
             Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
@@ -187,15 +187,6 @@ jobs:
           python -m build -n
 
       # Upload files
-
-      - name: Extract version
-        run: |
-          $content = Get-Content -Path "exllamav3/version.py" -Raw
-          $content -match '__version__\s*=\s*[''"]([^''"]+)[''"]'
-          $version = $matches[1]
-          echo "PKG_VERSION=$version" >> $env:GITHUB_ENV
-          echo "Found version: $version"
-        shell: pwsh
 
       - uses: actions/upload-artifact@v4
         if: matrix.artname == 'wheel'
