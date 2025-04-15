@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import math
 from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
-from ....util.memory import free_mem
+from ....util.memory import free_mem, list_gpu_tensors
 from ....util.hadamard import get_hadamard_dt
 from ....util import cuda_sync_active
 from functools import lru_cache
@@ -109,6 +109,12 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
         split_sizes = [tiles.shape[0] // len(devices)] * len(devices)
         split_sizes[-1] += tiles.shape[0] - sum(split_sizes)
 
+    # Account for negative splits (edge case if too many GPUs and/or tensor too small)
+    for i in range(len(split_sizes) - 2, -1, -1):
+        if split_sizes[i + 1] < 0:
+            split_sizes[i] += split_sizes[i + 1]
+            split_sizes[i + 1] = 0
+
     pin_split_tiles = torch.split(pin_tiles, split_sizes)
     pin_split_q_tiles = torch.split(pin_q_tiles, split_sizes)
     pin_split_q_idx = torch.split(pin_q_idx, split_sizes)
@@ -199,22 +205,50 @@ def quantize_tiles_multigpu_sync(tiles, quant_args: dict):
 
 def preapply_had_l(x: torch.Tensor, had_dim):
     k, n = x.shape
-    xdt = x.dtype
+    x_dtype = x.dtype
     x = x.to(torch.float)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
     x = (had @ x.view(-1, had_dim, n)).view(k, n)
-    x = x.to(xdt)
+    x = x.to(x_dtype)
     return x
 
 
 def preapply_had_r(x: torch.Tensor, had_dim):
     k, n = x.shape
-    xdt = x.dtype
+    x_dtype = x.dtype
     x = x.to(torch.float)
     had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
     x = (x.view(k, -1, had_dim) @ had).view(k, n)
-    x = x.to(xdt)
+    x = x.to(x_dtype)
     return x
+
+
+def blockwise_preapply_had_l_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    assert k % had_dim == 0
+    assert x.dtype == torch.float
+    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
+    num_blocks = k // had_dim
+    for i in range(num_blocks):
+        start = i * had_dim
+        end = start + had_dim
+        block = x[start:end, :]  # shape (had_dim, n)
+        block_transformed = had @ block.view(had_dim, n)
+        x[start:end, :] = block_transformed
+
+
+def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
+    k, n = x.shape
+    assert n % had_dim == 0
+    assert x.dtype == torch.float
+    had = get_hadamard_dt(had_dim, x.device, x.dtype, 1 / math.sqrt(had_dim))
+    num_blocks = n // had_dim
+    for i in range(num_blocks):
+        start = i * had_dim
+        end = start + had_dim
+        block = x[:, start:end]  # shape (k, had_dim)
+        block_transformed = block @ had
+        x[:, start:end] = block_transformed
 
 
 def block_ldl(H: torch.Tensor, b: int):
@@ -224,13 +258,39 @@ def block_ldl(H: torch.Tensor, b: int):
     m = n // b
 
     # Cholesky factorization: H = L @ L.T
-    L = torch.linalg.cholesky(H)
+    # Try on GPU first
+    try:
+        retry_cpu = False
+        L = torch.linalg.cholesky(H)
+        # H is not needed after this, move to CPU. Then overwrite H's GPU storage with L, since we can't otherwise
+        # free up that VRAM as the tensor is referenced by the parent frame
+        H_cpu = H.cpu()
+        H.copy_(L)  # VRAM copy, tiny overhead
+        L = H
+        H = H_cpu
+
+    # Fall back on CPU factorization
+    except Exception as e:
+        if e.__class__.__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(e) or "HIP out of memory" in str(e):
+            retry_cpu = True
+        else:
+            raise e
+    if retry_cpu:
+        print(f" !! Out of memory on {str(H.device)}, trying CPU fallback")
+        free_mem()
+        H_cpu = H.cpu()
+        L_cpu = torch.linalg.cholesky(H_cpu)
+        # This is ugly, but overwrite H in VRAM to avoid allocating a new tensor, then replace reference with CPU copy
+        H.copy_(L_cpu)
+        del L_cpu
+        L = H
+        H = H_cpu
 
     # Get blocks along diagonal of L: DL.shape = (m, b, b)
     DL = torch.diagonal(L.reshape(m, b, m, b), dim1 = 0, dim2 = 2).permute(2, 0, 1)
 
-    # Compute D as D[i] = DL[i] @ DL[i].T for each diagonal block i
-    D = DL @ DL.transpose(1, 2)
+    # Compute D as D[i] = DL[i] @ DL[i].T for each diagonal block i (don't actually end up needing this)
+    # D = DL @ DL.transpose(1, 2)
 
     # Invert each diagonal block
     DL = torch.linalg.inv(DL)
@@ -247,7 +307,7 @@ def block_ldl(H: torch.Tensor, b: int):
     dr = torch.arange(m)
     L_block[dr, dr] = torch.stack([torch.eye(b, device = L.device, dtype = H.dtype)] * m)
 
-    return L, D.to(DL.device)
+    return L, H  # , D.to(DL.device)
 
 
 def ldlq(
@@ -394,12 +454,12 @@ def finalize_capture_H(H_data: dict, quant_args: dict):
 
     # Input had
     H *= su.T
-    H = preapply_had_r(H, had_k)  # Todo: in-place had kernels, to save some memory here
+    blockwise_preapply_had_r_(H, had_k)
     H *= su
-    H = preapply_had_l(H, had_k)
+    blockwise_preapply_had_l_(H, had_k)
 
     # Get block LDL decomposition of H, zero diagonal
-    L, _ = block_ldl(H, 16)
+    L, H = block_ldl(H, 16)
     dr = torch.arange(k)
     L[dr, dr] = 0
     H_data["L"] = L
@@ -557,7 +617,8 @@ def quantize_exl3(
     quant_args: dict,
     return_weight_q: bool,
     progress_str: str | None = None,
-    verbose: bool = False
+    verbose: bool = False,
+    swap_to_device: torch.device | None = None
 ):
     """
     :param weight:
@@ -582,6 +643,9 @@ def quantize_exl3(
     :param verbose:
         Dump extra stats
 
+    :param swap_to_device:
+        If input tensor is on CPU, move to this device before quantization
+
     :return:
         tuple:
           - quantized weight
@@ -598,7 +662,7 @@ def quantize_exl3(
         if "seed" in quant_args:
             torch.manual_seed(quant_args["seed"])
 
-        device = weight.device
+        device = weight.device if swap_to_device is None else swap_to_device
         k, n = weight.shape
 
         # Get H, LDL decomp. and input sign flips
@@ -610,10 +674,12 @@ def quantize_exl3(
 
         codebook_scale = 1.24371088
 
+        if swap_to_device is not None:
+            weight = weight.to(swap_to_device)
         if verbose:
             weight_copy = weight.cpu()
         weight_r = weight
-        weight = None
+        del weight
 
         if verbose:
             rms = block_rms_n(weight_r, dim = 0)
@@ -659,9 +725,8 @@ def quantize_exl3(
             weight_r = weight_r.cpu()
 
         # Quantize
-        # free_mem()
         weight_q, encoded_q = ldlq(weight_r, L, quant_args, pb)
-        # free_mem()
+        del L
 
         pb.update(tiles_k)
 
@@ -669,14 +734,14 @@ def quantize_exl3(
         E = weight_r - weight_q  # may run on CPU
         W = weight_r
         Hd = H.to(device)
-        weight_r = None
+        del weight_r
         E = E.to(device)
         num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
-        E = None
+        del E
         W = W.to(device)
         den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
-        W = None
-        Hd = None
+        del W
+        del Hd
         proxy_err = num / max(den, 1e-8)
 
         # free_mem()

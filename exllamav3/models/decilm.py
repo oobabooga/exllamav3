@@ -7,7 +7,7 @@ from ..util.rope import RopeSettings, RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class Phi3Config(Config):
+class DeciLMConfig(Config):
 
     def __init__(
         self,
@@ -16,23 +16,21 @@ class Phi3Config(Config):
     ):
         super().__init__(
             directory,
-            kwargs.get("arch_string", "Phi3ForCausalLM"),
-            Phi3Model,
+            kwargs.get("arch_string", "DeciLMForCausalLM"),
+            DeciLMModel,
             **kwargs
         )
 
-        # Attention params
+        # Global attention params
         self.head_dim = self.read_cfg(int, "head_dim", None)
         self.hidden_size = self.read_cfg(int, "hidden_size", no_default)
         self.num_q_heads = self.read_cfg(int, "num_attention_heads", no_default)
-        self.num_kv_heads = self.read_cfg(int, "num_key_value_heads", self.num_q_heads)
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
-        # MLP
+        # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
-        self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
@@ -44,17 +42,17 @@ class Phi3Config(Config):
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
+        # Block configs
+        self.block_configs = self.read_cfg(list, "block_configs", no_default)
+        assert len(self.block_configs) == self.num_hidden_layers, \
+            "Number of hidden layers does not match length of block_configs list"
 
-    @override
-    def override_dynamic_seq_len(self, new_max_position_embeddings: int):
-        self.rope_settings.override_max_position_embeddings = new_max_position_embeddings
 
-
-class Phi3Model(Model):
+class DeciLMModel(Model):
 
     def __init__(
         self,
-        config: Phi3Config,
+        config: DeciLMConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -69,54 +67,81 @@ class Phi3Model(Model):
         ]
 
         self.first_block_idx = len(self.modules)
+        self.last_kv_module_idx = 0
+        cache_layer_idx = 0
 
-        self.modules += [
-            TransformerBlock(
-                config = config,
-                key = f"model.layers.{idx}",
+        for idx, cfg in enumerate(config.block_configs):
+            cfg_attn = cfg["attention"]
+            cfg_ffn = cfg["ffn"]
+
+            if cfg_attn.get("no_op"):
+                attn_norm = None
+                attn = None
+            else:
+                assert not cfg_attn.get("num_sink_tokens"), "DeciLM: num_sink_tokens not supported"
+                assert not cfg_attn.get("replace_with_linear"), "DeciLM: replace_with_linear not supported"
+                assert not cfg_attn.get("sparsify"), "DeciLM: sparsify not supported"
+                assert not cfg_attn.get("unshifted_sink"), "DeciLM: unshifted_sink not supported"
+                assert not cfg_attn.get("use_prefill_window_in_sink_attention"), \
+                    "DeciLM: use_prefill_window_in_sink_attention not supported"
                 attn_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
-                ),
+                )
                 attn = Attention(
                     config = config,
                     key = f"model.layers.{idx}.self_attn",
-                    layer_idx = idx,
+                    layer_idx = cache_layer_idx,
                     hidden_size = config.hidden_size,
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
-                    num_kv_heads = config.num_kv_heads,
+                    num_kv_heads = config.num_q_heads // cfg_attn["n_heads_in_group"],
                     rope_settings = config.rope_settings,
                     sm_scale = None,
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    key_fused_qkv = "qkv_proj",
                     qmap = "block.attn",
-                ),
+                )
+                cache_layer_idx += 1
+                self.last_kv_module_idx = len(self.modules)
+
+            if cfg_ffn.get("no_op"):
+                mlp_norm = None
+                mlp = None
+            else:
+                assert not cfg_ffn.get("replace_with_linear"), "DeciLM: replace_with_linear not supported"
+                assert not cfg_ffn.get("sparsify"), "DeciLM: sparsify not supported"
                 mlp_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
-                ),
+                )
+                interm_size = int(2 * cfg_ffn["ffn_mult"] * config.hidden_size / 3)
+                interm_size = ((interm_size + 255) // 256) * 256
                 mlp = GatedMLP(
                     config = config,
                     key = f"model.layers.{idx}.mlp",
                     hidden_size = config.hidden_size,
-                    intermediate_size = config.intermediate_size,
+                    intermediate_size = interm_size,
                     key_up = "up_proj",
                     key_gate = "gate_proj",
                     key_down = "down_proj",
-                    key_fused_gate_up = "gate_up_proj",
                     qmap = "block.mlp",
-                ),
-            )
-            for idx in range(config.num_hidden_layers)
-        ]
+                )
 
-        self.last_kv_module_idx = len(self.modules) - 1
+            self.modules += [
+                TransformerBlock(
+                    config = config,
+                    key = f"model.layers.{idx}",
+                    attn_norm = attn_norm,
+                    attn = attn,
+                    mlp_norm = mlp_norm,
+                    mlp = mlp,
+                )
+            ]
 
         head_alt_key = None
         if config.tie_word_embeddings and not self.config.stc.has_tensor("lm_head"):

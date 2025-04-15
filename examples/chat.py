@@ -5,13 +5,9 @@ import argparse
 from exllamav3 import Generator, Job, model_init
 from chat_templates import *
 import torch
+from chat_console import *
 
-# ANSI color codes
-col_default = "\u001b[0m"
-col_user = "\u001b[33;1m"  # Yellow
-col_bot = "\u001b[34;1m"  # Blue
-col_error = "\u001b[31;1m"  # Magenta
-col_sysprompt = "\u001b[37;1m"  # Grey
+thinktag = ("<think>", "</think>")
 
 @torch.inference_mode()
 def main(args):
@@ -29,6 +25,13 @@ def main(args):
     system_prompt = prompt_format.default_system_prompt() if not args.system_prompt else args.system_prompt
     add_bos = prompt_format.add_bos()
     max_response_tokens = args.max_response_tokens
+
+    if args.basic_console:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_basic
+    else:
+        read_input_fn = read_input_ptk
+        streamer_cm = Streamer_rich
 
     # Load model
     model, config, cache, tokenizer = model_init.init(args)
@@ -49,16 +52,14 @@ def main(args):
     while True:
 
         # Get user prompt and add to context
-        print("\n" + col_user + user_name + ": " + col_default, end = '', flush = True)
-        if args.mli:
-            user_prompt = sys.stdin.read().rstrip()
-        else:
-            user_prompt = input().strip()
+        user_prompt = read_input_fn(args, user_name)
         context.append((user_prompt, None))
 
         # Tokenize context and trim from head if too long
         def get_input_ids():
             frm_context = prompt_format.format(system_prompt, context)
+            if args.think:
+                frm_context += thinktag[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
             return ids_, exp_len_
@@ -70,7 +71,6 @@ def main(args):
                 ids, exp_len = get_input_ids()
 
         # Inference
-        print("\n" + col_bot + bot_name + ": " + col_default, end = "")
         job = Job(
             input_ids = ids,
             max_new_tokens =  max_response_tokens,
@@ -79,22 +79,25 @@ def main(args):
         generator.enqueue(job)
 
         # Stream response
-        response = ""
-        while generator.num_remaining_jobs():
-            for r in generator.iterate():
-                chunk = r.get("text", "")
-                if not response and chunk.startswith(" "):
-                    print(chunk[1:], end = "", flush = True)
-                else:
-                    print(chunk, end = "", flush = True)
-                response += chunk
-                if r["eos"] and r["eos_reason"] == "max_new_tokens":
-                    print("\n" + col_error + f" !! Response exceeded {max_response_tokens} tokens and was cut short." + col_default)
-        if not response.endswith("\n"):
-            print()
+        ctx_exceeded = False
+        with streamer_cm(args, bot_name) as s:
+            while generator.num_remaining_jobs():
+                for r in generator.iterate():
+                    chunk = r.get("text", "")
+                    s.stream(chunk, thinktag[1])
+                    if r["eos"] and r["eos_reason"] == "max_new_tokens":
+                        ctx_exceeded = True
+
+        if ctx_exceeded:
+            print(
+                "\n" + col_error + f" !! Response exceeded {max_response_tokens} tokens "
+                "and was cut short." + col_default
+            )
 
         # Add response to context
-        context[-1] = (user_prompt, response.strip())
+        response = s.all_text.strip()
+
+        context[-1] = (user_prompt, response)
 
 
 if __name__ == "__main__":
@@ -104,9 +107,12 @@ if __name__ == "__main__":
     parser.add_argument("-modes", "--modes", action = "store_true", help = "List available prompt modes and exit")
     parser.add_argument("-un", "--user_name", type = str, default = "User", help = "User name (raw mode only)")
     parser.add_argument("-bn", "--bot_name", type = str, default = "Assistant", help = "Bot name (raw mode only)")
-    parser.add_argument("-mli", "--mli", action = "store_true", help = "Enable multi line input")
+    parser.add_argument("-mli", "--multiline", action = "store_true", help = "Enable multi line input (use Alt+Enter to submit input)")
     parser.add_argument("-sp", "--system_prompt", type = str, help = "Use custom system prompt")
     parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000, help = "Max tokens per response, default = 1000")
+    parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
+    parser.add_argument("-rps", "--refresh_per_second", type = int, help = "Max updates per second in Markdown mode, default = 25", default = 25)
+    parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
     # TODO: Sampling options
     _args = parser.parse_args()
     main(_args)

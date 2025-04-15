@@ -4,7 +4,7 @@ import time
 import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear
-from ..modules.quant import LinearFP16
+from ..modules.quant import LinearFP16, LinearEXL3
 from ..util.progress import ProgressBar
 from ..util.memory import free_mem
 from ..util import Timer, human_time
@@ -27,7 +27,7 @@ parser.add_argument("-hb", "--head_bits", type = int, default = None, help = "Bi
 parser.add_argument("-resume", "--resume", action = "store_true", help = "Resume interrupted job from working directory")
 parser.add_argument("-cr", "--cal_rows", type = int, help = "Calibration data size, rows, default: 100")
 parser.add_argument("-cc", "--cal_cols", type = int, help = "Calibration data size, columns, default: 2048")
-parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 60, help = "Minimum checkpoint interval, in seconds")
+parser.add_argument("-cpi", "--checkpoint_interval", type = int, default = 120, help = "Minimum checkpoint interval, in seconds")
 parser.add_argument("-lcpi", "--last_checkpoint_index", type = int, default = None, help = "Last module index to checkpoint (for debug purposes)")
 parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mode")
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
@@ -210,6 +210,8 @@ def main(args, job_state):
         device_ratios = None
 
     last_checkpoint_time = time.time()
+    start_time = time.time()
+    timed_blocks = 0
 
     # Get model
     config, model, tokenizer = get_base_model(args)
@@ -221,103 +223,129 @@ def main(args, job_state):
     for idx, module in enumerate(model.modules):
 
         start_module_time = time.time()
+        if idx == model.first_block_idx:
+            start_time = time.time()
+            timed_blocks = 0
 
         # If resuming, skip along to checkpoint index
         if idx < job_state["next_module_idx"]:
             continue
 
-        # Load current module
-        print(f" -- Loading unquantized module: {module.key}")
-        module.load(torch.device("cpu") if module.caps.get("prefer_cpu") else device)
-        for m in module:
-            if m.used_alt_key:
-                print(f"     - Cloned {m.key} from {m.alt_key}")
-
-        # Skip modules without quant targets
-        qmaps = module.get_qmaps()
-        if len(qmaps) > 0:
-
-            # Capture calibration input states during forward pass
-            with ProgressBar(f" -- Capturing: {module.key}", len(state)) as progress:
-                capture_H = {}
-                ref_states = []
-                for i in range(len(state)):
-                    progress.update(i)
-                    params = {
-                        "attn_mode": "flash_attn_nc",
-                        "capture": capture_H
-                    }
-                    rs = module.prepare_for_device(state[i], params)
-                    rs = module.forward(rs, params)
-                    if i < num_ref_states:
-                        ref_states.append(rs.cpu())
-                    rs = None
-            print(f" -- Captured: {module.key}")
-            sys.stdout.flush()
-
-            # Swap captured H to system RAM
-            for k, v in capture_H.items():
-                v["H_swap_device"] = v["H"].device
-                v["H"] = v["H"].cpu()
-
-        # Get submodules to quantize
-        linears = [m for m in module if isinstance(m, Linear) and m.qmap]
-
-        # Move original tensors to system RAM (load to GPU one by one when quantizing)
-        for linear in linears:
-            assert isinstance(linear.inner, LinearFP16)
-            linear.inner.swap_cpu()
+        # Collect output tensors
+        q_tensors = {}
 
         # Quantization strategy
-        if linears:
-            strategy, surplus = module.allocate_q(
-                {
-                    "bits": args["bits"],
-                    "head_bits": args["head_bits"],
-                },
-                job_state["surplus_bits"],
-            )
-            job_state["surplus_bits"] = surplus
-            assert all(m.key in strategy for m in linears), \
-                f" ## Logic error, no quantization strategy for {m.key}"
+        strategy, surplus = module.allocate_q(
+            {
+                "bits": args["bits"],
+                "head_bits": args["head_bits"],
+            },
+            job_state["surplus_bits"],
+        )
+        job_state["surplus_bits"] = surplus
 
-        # Quantize module
-        for linear in linears:
-            linear.inner.unswap_cpu()
-            quant_args = {
-                "seed": idx,
-                "K": strategy[linear.key],
-                "devices": devices,
-                "device_ratios": device_ratios,
-            }
-            with Timer() as t:
-                proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap],
-                    quant_args = quant_args,
-                    progress_str = f" -- <step>: {linear.key}",
-                    verbose = args["verbose"]
+        # Slice module if necessary
+        slicing = module.num_slices > 1
+        for current_slice in range(module.num_slices):
+
+            # Load current module
+            slice_str = f" (slice {current_slice + 1}/{module.num_slices})" if slicing else ""
+            print(f" -- Loading unquantized module: {module.key}" + slice_str)
+            module.load(
+                torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+                load_slice = current_slice if slicing else None
+            )
+            for m in module:
+                if m.used_alt_key and not slicing:
+                    print(f"     - Cloned {m.key} from {m.alt_key}")
+
+            # Skip modules without quant targets
+            qmaps = module.get_qmaps()
+            if len(qmaps) > 0:
+
+                # Capture calibration input states during forward pass
+                with ProgressBar(f" -- Capturing: {module.key}" + slice_str, len(state)) as progress:
+                    capture_H = {}
+                    ref_states = []
+                    for i in range(len(state)):
+                        progress.update(i)
+                        params = {
+                            "attn_mode": "flash_attn_nc",
+                            "capture": capture_H,
+                        }
+                        if slicing:
+                             params["q_mlp_slice"] = current_slice
+                        rs = module.prepare_for_device(state[i], params)
+                        rs = module.forward(rs, params)
+                        if i < num_ref_states:
+                            ref_states.append(rs.cpu())
+                        rs = None
+                print(f" -- Captured: {module.key}" + slice_str)
+                sys.stdout.flush()
+
+                # Swap captured H to system RAM
+                for k, v in capture_H.items():
+                    v["H_swap_device"] = v["H"].device
+                    v["H"] = v["H"].cpu()
+
+            # Get submodules to quantize
+            linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
+            assert all(linear.key in strategy for linear in linears), \
+                f" ## Logic error, no quantization strategy for module"
+            assert all(isinstance(linear.inner, LinearFP16) for linear in linears)
+
+            # Move original tensors to system RAM (load to GPU one by one when quantizing)
+            for linear in linears:
+                linear.inner.swap_cpu()
+
+            # Quantize module
+            for linear in linears:
+                quant_args = {
+                    "seed": idx,
+                    "K": strategy[linear.key],
+                    "devices": devices,
+                    "device_ratios": device_ratios,
+                }
+                with Timer() as t:
+                    proxy_err = linear.convert_exl3(
+                        capture_H[linear.qmap],
+                        quant_args = quant_args,
+                        progress_str = f" -- <step>: {linear.key}",
+                        verbose = args["verbose"]
+                    )
+                    assert isinstance(linear.inner, LinearEXL3)
+                    linear.inner.swap_cpu()
+                print(
+                    f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
+                    f"  bpw: {quant_args['K']:5.2f}"
+                    f"  proxy_err: {proxy_err:8.6f}"
+                    f"  [{t.interval:4.2f} s]"
                 )
-            print(
-                f" -- Quantized: {linear.key:{config.stc.max_key_len()}}"
-                f"  bpw: {quant_args['K']:5.2f}"
-                f"  proxy_err: {proxy_err:8.6f}"
-                f"  [{t.interval:4.2f} s]"
-            )
-            sys.stdout.flush()
+                sys.stdout.flush()
 
-        # Save converted module tensors
-        tensors = {}
-        for m in module:
-            tensors.update(m.get_tensors())
-        save_tensor(tensors, f"qtensors/{module.key}.safetensors", args)
+            # Collect converted module tensors
+            for m in module:
+                q_tensors.update(m.get_tensors())
+
+            # Unload module
+            module.unload()
+
+        # Save layer tensors to working directory
+        save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
 
         # Output final bpw for layer
-        num_bytes = dsize(tensors)
+        num_bytes = dsize(q_tensors)
         num_bits = num_bytes * 8
-        final_bpw = num_bits / module.weights_numel()
+        final_bpw = num_bits / module.weights_numel() if module.weights_numel() else None
 
-        del tensors
-        # free_mem()
+        # Reload module from memory
+        config.stc.set_new_tensors(q_tensors)
+        module.load(
+            torch.device("cpu") if module.caps.get("prefer_cpu") else device,
+            source = q_tensors
+        )
+        config.stc.set_new_tensors(None)
+        del q_tensors
 
         # Advance state
         error = 0
@@ -339,14 +367,16 @@ def main(args, job_state):
         # Feedback after module
         module_time = time.time() - start_module_time
         print(
-            f" -- Quantized: {module.key:47}"
-            f"  bpw: {final_bpw:5.2f}"
-            f"        rfn: {error:.6f}"
+            f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
+            (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
+            (f"        rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
             f"  [{module_time:.2f} s]"
         )
         sys.stdout.flush()
-        if idx >= 1:
-            est_remaining = module_time * (len(model.modules) - idx - 1)
+        if idx >= model.first_block_idx:
+            overall_time = time.time() - start_time
+            timed_blocks += 1
+            est_remaining = (overall_time / timed_blocks) * (len(model.modules) - idx)
             print(f" -- Estimated remaining time: {human_time(est_remaining)}")
 
         # Unload current module

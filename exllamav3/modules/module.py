@@ -35,16 +35,17 @@ class Module(ABC):
         self.modules = []
         self.caps = {}
         self.qmap = qmap
+        self.num_slices = 1
 
     def __iter__(self):
         yield self
         for module in self.modules:
             yield from module
 
-    def load(self, device: torch.Device):
+    def load(self, device: torch.Device, **kwargs):
         self.device = device
         for module in self.modules:
-            module.load(device)
+            module.load(device, **kwargs)
 
     def unload(self):
         self.device = None
@@ -88,3 +89,6 @@ class Module(ABC):
 
     def quant_format_id(self):
         return None
+
+    def get_name(self):
+        return self.__class__.__name__
