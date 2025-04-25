@@ -33,12 +33,14 @@ class Linear(Module):
         full_out_features: int | None = None,
         first_in_feature: int | None = None,
         first_out_feature: int | None = None,
-        out_dtype: torch.dtype | None = None
+        out_dtype: torch.dtype | None = None,
+        allow_input_padding: bool = False,
     ):
         super().__init__(config, key, qmap)
 
         self.alt_key = alt_key
-        self.in_features = in_features
+        self.in_features_unpadded = in_features
+        self.in_features = (in_features + pad_to - 1) // pad_to * pad_to
         self.out_features_unpadded = out_features
         self.out_features = (out_features + pad_to - 1) // pad_to * pad_to
         self.full_in_features = full_in_features
@@ -54,16 +56,22 @@ class Linear(Module):
         self.is_sliced = in_features != full_in_features or out_features != full_out_features
         self.out_dtype = out_dtype
 
+        assert self.in_features_unpadded == self.in_features or allow_input_padding, \
+            f"Input padding is not allowed for {self.key}, in_dim: {self.in_features_unpadded}, pad_to: {pad_to}"
+
         if caps is not None:
             self.caps.update(caps)
 
 
     def pad_out(self, w: torch.Tensor | None) -> torch.Tensor | None:
-        if w is None or self.out_features == self.out_features_unpadded:
+        if w is None or self.out_features == self.out_features_unpadded and self.in_features == self.in_features_unpadded:
             return w
         if w.dim() == 2:
             padded = torch.zeros((self.out_features, self.in_features), dtype = w.dtype, device = w.device)
-            padded[:w.shape[0], :] = w
+            if self.out_features != self.out_features_unpadded:
+                padded[:w.shape[0], :] = w
+            elif self.in_features != self.in_features_unpadded:
+                padded[:, :w.shape[1]] = w
         else:
             assert w.dim() == 1
             padded = torch.zeros((self.out_features,), dtype = w.dtype, device = w.device)

@@ -7,8 +7,6 @@ from chat_templates import *
 import torch
 from chat_console import *
 
-thinktag = ("<think>", "</think>")
-
 @torch.inference_mode()
 def main(args):
 
@@ -51,6 +49,10 @@ def main(args):
 
     while True:
 
+        # Amnesia mode
+        if args.amnesia:
+            context = []
+
         # Get user prompt and add to context
         user_prompt = read_input_fn(args, user_name)
         context.append((user_prompt, None))
@@ -59,7 +61,7 @@ def main(args):
         def get_input_ids():
             frm_context = prompt_format.format(system_prompt, context)
             if args.think:
-                frm_context += thinktag[0]
+                frm_context += prompt_format.thinktag()[0]
             ids_ = tokenizer.encode(frm_context, add_bos = add_bos, encode_special_tokens = True)
             exp_len_ = ids_.shape[-1] + max_response_tokens + 1
             return ids_, exp_len_
@@ -84,7 +86,7 @@ def main(args):
             while generator.num_remaining_jobs():
                 for r in generator.iterate():
                     chunk = r.get("text", "")
-                    s.stream(chunk, thinktag[1])
+                    s.stream(chunk, prompt_format.thinktag()[1])
                     if r["eos"] and r["eos_reason"] == "max_new_tokens":
                         ctx_exceeded = True
 
@@ -113,6 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("-basic", "--basic_console", action = "store_true", help = "Use basic console output (no markdown and fancy prompt input")
     parser.add_argument("-rps", "--refresh_per_second", type = int, help = "Max updates per second in Markdown mode, default = 25", default = 25)
     parser.add_argument("-think", "--think", action = "store_true", help = "Use (very simplistic) reasoning template and formatting")
+    parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context with every new prompt")
     # TODO: Sampling options
     _args = parser.parse_args()
     main(_args)

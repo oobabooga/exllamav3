@@ -56,11 +56,17 @@ class SS_Base:
 
 
 class SS_NoOp(SS_Base):
+    """
+    Empty sampling step
+    """
     def run(self, state: SamplingState):
         pass
 
 
 class SS_Argmax(SS_Base):
+    """
+    Final sampling step: select most likely token
+    """
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
@@ -79,6 +85,9 @@ class SS_Argmax(SS_Base):
 
 
 class SS_Sample(SS_Base):
+    """
+    Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
+    """
     def run(self, state: SamplingState):
         # TODO: Fused Gumbel noise + argmax kernel
         # TODO: Evaluate if multinomial sampling from sorted prob. distribution is more efficient
@@ -104,7 +113,30 @@ class SS_Sample(SS_Base):
         state.state = SS.DONE
 
 
+class SS_Sample_mn(SS_Sample):
+    """
+    Categorical sampling, but only using torch.multinomial (for testing/validation)
+    """
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N_S | SS.PROBS_N:
+                state.sample = torch.multinomial(state.probs, num_samples = 1)
+            case _:
+                raise ValueError("Sampling logic error")
+        state.state = SS.DONE
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize]
+            case _:
+                return None
+
+
 class SS_Temperature(SS_Base):
+    """
+    Modify distribution with temperature scaling
+    """
     def __init__(self, temperature: float):
         self.temperature = temperature
 
@@ -132,6 +164,9 @@ class SS_Temperature(SS_Base):
 
 
 class SS_Normalize(SS_Base):
+    """
+    Normalize distribution
+    """
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
@@ -154,6 +189,9 @@ class SS_Normalize(SS_Base):
 
 
 class SS_Sort(SS_Base):
+    """
+    Sort tokens by descending probability. state.indices
+    """
     def run(self, state: SamplingState):
         match state.state:
             case SS.INIT:
@@ -174,6 +212,9 @@ class SS_Sort(SS_Base):
 
 
 class SS_TopK(SS_Base):
+    """
+    Mask out all but the top K most likely tokens
+    """
     def __init__(self, top_k: int):
         assert top_k >= 1
         self.top_k = top_k
@@ -197,6 +238,10 @@ class SS_TopK(SS_Base):
 
 
 class SS_TopP(SS_Base):
+    """
+    Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
+    remainig tokens
+    """
     def __init__(self, top_p: float):
         self.top_p = top_p
         assert 0.0 < top_p <= 1.0
@@ -222,6 +267,36 @@ class SS_TopP(SS_Base):
                 return None
 
 
+class SS_MinP(SS_Base):
+    """
+    Mask out all tokens whose probability is less than the top token's probability times min_p
+    """
+    def __init__(self, min_p: float):
+        self.min_p = min_p
+        assert 0.0 < min_p <= 1.0
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.PROBS_N:
+                threshold = state.probs.amax(dim = -1, keepdim = True) * self.min_p
+                mask = state.probs >= threshold
+                state.probs *= mask
+                state.state = SS.PROBS
+            case SS.PROBS_N_S:
+                threshold = state.probs[:, :1] * self.min_p
+                mask = state.probs >= threshold
+                state.probs *= mask
+                state.state = SS.PROBS_S
+            case _:
+                raise ValueError("Sampling logic error")
+
+    def prep(self, in_state: SS):
+        match in_state:
+            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
+                return [SS_Normalize]
+            case _:
+                return None
+
+
 class CustomSampler(Sampler):
     def __init__(
         self,
@@ -241,6 +316,8 @@ class CustomSampler(Sampler):
                     self.steps.append(prep_step())
             self.steps.append(step)
 
+        # TODO: Identify and remove redundant sampling steps, add rules for fusing steps where possible
+
     @override
     @torch.inference_mode
     def forward(
@@ -251,6 +328,7 @@ class CustomSampler(Sampler):
         tokenizer: Tokenizer | None = None,
         blocked_tokens: list[int] | None = None,
         allowed_tokens: list[int] | None = None,
+        return_state: bool = False
     ):
         out_shape = logits.shape[:-1]
 
@@ -286,6 +364,6 @@ class CustomSampler(Sampler):
         for ss in self.steps:
             assert state.state != SS.DONE, "Sampling logic error"
             ss.run(state)
-        assert state.state == SS.DONE, "Sampling logic error"
+        assert return_state or state.state == SS.DONE, "Sampling logic error"
 
-        return state.sample.view(out_shape)
+        return state if return_state else state.sample.view(out_shape)
