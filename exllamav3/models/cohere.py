@@ -4,11 +4,11 @@ import torch
 from .config import Config, no_default
 from .model import Model
 from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
+from ..modules import LayerNorm, Embedding, ParallelDecoderBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class Phi3Config(Config):
-    arch_string = "Phi3ForCausalLM"
+class CohereConfig(Config):
+    arch_string = "CohereForCausalLM"
 
     def __init__(
         self,
@@ -17,7 +17,7 @@ class Phi3Config(Config):
     ):
         super().__init__(
             directory,
-            Phi3Model,
+            CohereModel,
             **kwargs
         )
 
@@ -30,32 +30,30 @@ class Phi3Config(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
-        # MLP
+        # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
 
         # Norms
-        self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
+        self.layernorm_eps = self.read_cfg(float, "layer_norm_eps", 1e-05)
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
+
+        # Logit scale
+        self.logit_scale = self.read_cfg(float, "logit_scale", 0.0625)
 
 
-    @override
-    def override_dynamic_seq_len(self, new_max_position_embeddings: int):
-        self.rope_settings.override_max_position_embeddings = new_max_position_embeddings
-
-
-class Phi3Model(Model):
-    config_class = Phi3Config
+class CohereModel(Model):
+    config_class = CohereConfig
 
     def __init__(
         self,
-        config: Phi3Config,
+        config: CohereConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -72,13 +70,13 @@ class Phi3Model(Model):
         self.first_block_idx = len(self.modules)
 
         self.modules += [
-            TransformerBlock(
+            ParallelDecoderBlock(
                 config = config,
                 key = f"model.layers.{idx}",
-                attn_norm = RMSNorm(
+                input_norm = LayerNorm(
                     config = config,
                     key = f"model.layers.{idx}.input_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
+                    layernorm_eps = config.layernorm_eps,
                 ),
                 attn = Attention(
                     config = config,
@@ -94,13 +92,7 @@ class Phi3Model(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    key_fused_qkv = "qkv_proj",
-                    qmap = "block.attn",
-                ),
-                mlp_norm = RMSNorm(
-                    config = config,
-                    key = f"model.layers.{idx}.post_attention_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
+                    qmap = "block.parallel",
                 ),
                 mlp = GatedMLP(
                     config = config,
@@ -110,8 +102,7 @@ class Phi3Model(Model):
                     key_up = "up_proj",
                     key_gate = "gate_proj",
                     key_down = "down_proj",
-                    key_fused_gate_up = "gate_up_proj",
-                    qmap = "block.mlp",
+                    qmap = "block.parallel",
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -124,10 +115,10 @@ class Phi3Model(Model):
             head_alt_key = "model.embed_tokens"
 
         self.modules += [
-            RMSNorm(
+            LayerNorm(
                 config = config,
                 key = "model.norm",
-                rms_norm_eps = config.rms_norm_eps,
+                layernorm_eps = config.layernorm_eps,
                 out_dtype = torch.half,
             ),
             Linear(
@@ -138,7 +129,8 @@ class Phi3Model(Model):
                 in_features = config.hidden_size,
                 out_features = config.vocab_size,
                 qmap = "block",
-                caps = {"logits_output": True}
+                caps = {"logits_output": True},
+                post_scale = config.logit_scale
             )
         ]
 
