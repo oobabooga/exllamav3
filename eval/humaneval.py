@@ -14,12 +14,12 @@ prompt_formats = {
         "    "
     ),
     "granite": (
-        "Question:\nComplete the following Python function:\n\n{{problem}}\n\nAnswer:\n"
+        "<|endoftext|>Question:\nComplete the following Python function:\n\n{{problem}}\n\nAnswer:\n"
         "Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
         "    "
     ),
     "llama": (
-        "[INST] <<SYS>>\n"
+        "<s>[INST] <<SYS>>\n"
         "You are a helpful AI coding assistant.\n"
         "<</SYS>>\n\n"
         "Complete the following Python function:\n\n"
@@ -28,7 +28,7 @@ prompt_formats = {
         "    "
     ),
     "llama3": (
-        "<|start_header_id|>system<|end_header_id|>\n\n"
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
         "You are a helpful AI coding assistant.<|eot_id|>"
         "<|start_header_id|>user<|end_header_id|>\n\n"
         "Complete the following Python function:\n\n{{problem}}<|eot_id|>"
@@ -37,7 +37,7 @@ prompt_formats = {
         "    "
     ),
     "mistral": (
-        "[INST] You are a helpful AI coding assistant.\n\n"
+        "<s>[INST] You are a helpful AI coding assistant.\n\n"
         "Complete the following Python function:\n\n"
         "{{problem}}[/INST]"
         " Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
@@ -51,7 +51,7 @@ prompt_formats = {
         "    "
     ),
     "reka": (
-        "human: Complete the following Python function."
+        "<|endoftext|>human: Complete the following Python function."
         " Provide your reasoning in comments, but be concise and don't second-guess."
         "\n\n{{problem}}"
         " <sep> assistant: ```python\n{{problem}}",
@@ -66,8 +66,17 @@ prompt_formats = {
         "Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
         "    "
     ),
+    "qwen3": (
+        "<|im_start|>system\n"
+        "You are a helpful AI coding assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "Complete the following Python function:\n\n{{problem}}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+        "<think>\n\n</think>\n\nSure! Here is how you might implement the function:\n\n```python\n{{problem}}",
+        "    "
+    ),
     "deepseek": (
-        "You are a helpful AI coding assistant.\n"
+        "<｜begin▁of▁sentence｜>You are a helpful AI coding assistant.\n"
         "<｜User｜>Complete the following Python function:\n\n{{problem}}"
         "<｜Assistant｜>Sure! Here is how you might implement the function:\n\n```python\n{{problem}}",
         "    "
@@ -99,7 +108,6 @@ def main(args):
         tokenizer = tokenizer
     )
     sampler = ComboSampler(
-        rep_p = args.rep_p,
         temperature = args.temperature,
         min_p = args.min_p,
         top_k = args.top_k,
@@ -116,7 +124,11 @@ def main(args):
         for idx, (problem_id, problem) in enumerate(problems.items()):
             b_problem = problem["prompt"]
             f_problem = prompt_format.replace("{{problem}}", b_problem)
-            input_ids = tokenizer.encode(f_problem, encode_special_tokens = True, add_bos = True)
+            input_ids = tokenizer.encode(
+                f_problem,
+                encode_special_tokens = True,
+                add_bos = (args.prompt_format == "raw")
+            )
             for s in range(num_samples_per_task):
                 job = Job(
                     input_ids = input_ids,
@@ -189,10 +201,9 @@ if __name__ == "__main__":
     parser.add_argument("-e", "--eval", action = "store_true", help = "Run evaluation script on output file after sampling")
     parser.add_argument("-temp", "--temperature", type = float, help = "Sampling temperature (0 for greedy), default: 0.6", default = 0.6)
     parser.add_argument("-minp", "--min_p", type = float, help = "Min-p sampling, default: 0.0 (disabled)", default = 0.0)
-    parser.add_argument("-topk", "--top_k", type = float, help = "Top-k sampling, default: 0.0 (disabled)", default = 0.0)
+    parser.add_argument("-topk", "--top_k", type = int, help = "Top-k sampling, default: 0 (disabled)", default = 0)
     parser.add_argument("-topp", "--top_p", type = float, help = "Top-p sampling, default: 0.6", default = 0.6)
     parser.add_argument("-templast", "--temp_last", action = "store_true", help = "Use temperature last")
-    parser.add_argument("-repp", "--rep_p", type = float, help = "Repetition penalty, default: 1.0 (disabled)", default = 1.0)
     parser.add_argument("--max_tokens", type = int, default = 768, help = "Max number of tokens for each completion")
     _args = parser.parse_args()
     main(_args)
