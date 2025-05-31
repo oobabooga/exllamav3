@@ -10,6 +10,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_kernel_map.cuh"
 #include "exl3_devctx.cuh"
+#include <set>
 
 /*
 EXL3 matmul, A @ B -> C
@@ -26,6 +27,8 @@ limitations:
 - n % 128 == 0
 */
 
+std::set<void*> kernel_attr_set[MAX_DEVICES] = {};
+
 int exl3_gemm
 (
     const at::Tensor& A,
@@ -34,7 +37,9 @@ int exl3_gemm
     const c10::optional<at::Tensor>& suh,
     const c10::optional<at::Tensor>& A_had,
     const c10::optional<at::Tensor>& svh,
-    int force_shape_idx
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -42,8 +47,8 @@ int exl3_gemm
 
     TORCH_CHECK_DIM(B, 3);
     TORCH_CHECK_SHAPES(A, 1, B, 0, 16);
-    TORCH_CHECK_SHAPES(C, 1, B, 1, 16);
-    TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
+    TORCH_CHECK_SHAPES(C, -1, B, 1, 16);
+//    TORCH_CHECK_SHAPES(A, 0, C, 0, 1);
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kShort);
     bool c_fp32 = C.dtype() == at::kFloat;
@@ -54,16 +59,16 @@ int exl3_gemm
     half* A_had_ptr = nullptr;
     if (suh_ptr)
     {
-        TORCH_CHECK_SHAPES(suh.value(), 0, A, 1, 1);
+//        TORCH_CHECK_SHAPES(suh.value(), 0, A, 1, 1);
         A_had_ptr = (half*) OPTPTR(A_had);
-        TORCH_CHECK(A_had_ptr, "Must supply A_had with suh");
-        TORCH_CHECK_SHAPES_FULL(A_had.value(), A);
+//        TORCH_CHECK(A_had_ptr, "Must supply A_had with suh");
+//        TORCH_CHECK_SHAPES_FULL(A_had.value(), A);
     }
 
     // Get SV, optionally
     const half* svh_ptr = (const half*) OPTPTR(svh);
-    if (svh_ptr)
-        TORCH_CHECK_SHAPES(svh.value(), 0, B, 1, 16);
+//    if (svh_ptr)
+//        TORCH_CHECK_SHAPES(svh.value(), 0, B, 1, 16);
 
     // Device properties
     int device;
@@ -82,18 +87,28 @@ int exl3_gemm
     int size_n = B.size(1) * 16;
 
     // Select kernel
+    TORCH_CHECK(!(mcg_mult && mul1_mult), "Specified both mcg_mult and mul1_mult")
+    int cb = 0;
+    uint32_t mult = 0;
+    if (mcg_mult) { cb = 1; mult = mcg_mult; }
+    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+
     int selected_shape;
     int block_dim;
     fp_exl3_gemm_kernel kernel = select_exl3_gemm_kernel
     (
         cc, size_m, size_k, size_n, bits, c_fp32,
         force_shape_idx, &block_dim, &selected_shape,
-        &num_sms
+        &num_sms, cb
     );
     if (!kernel) return 0;
 
     // Launch
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    if (kernel_attr_set[device].find((void*)kernel) == kernel_attr_set[device].end())
+    {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        kernel_attr_set[device].insert((void*)kernel);
+    }
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -106,6 +121,7 @@ int exl3_gemm
         (void*)& suh_ptr,
         (void*)& A_had_ptr,
         (void*)& svh_ptr,
+        (void*)& mult
     };
     cudaLaunchCooperativeKernel
     (
@@ -146,7 +162,9 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& indices,
     const c10::optional<at::Tensor>& weights,
     int K,
-    int force_shape_idx
+    int force_shape_idx,
+    uint32_t mcg_mult,
+    uint32_t mul1_mult
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -175,14 +193,14 @@ int exl3_mgemm
     const long* indices_ptr = (const long*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
 
-    int num_B = 0;
+    // int num_B = 0;
     if (indices)
     {
         TORCH_CHECK_DIM(indices.value(), 2);
         TORCH_CHECK_SHAPES(indices.value(), 1, C, 0, 1);
-        num_B = indices.value().size(1);
+        // num_B = indices.value().size(1);
     }
-    else TORCH_CHECK(false, "Must specify indices");
+    //else TORCH_CHECK(false, "Must specify indices");
 
     if (weights)
     {
@@ -210,13 +228,19 @@ int exl3_mgemm
     const uintptr_t* svh_ptr_ptr = (const uintptr_t*) svh.data_ptr();
 
     // Select kernel
+    TORCH_CHECK(!(mcg_mult && mul1_mult), "Specified both mcg_mult and mul1_mult")
+    int cb = 0;
+    uint32_t mult = 0;
+    if (mcg_mult) { cb = 1; mult = mcg_mult; }
+    if (mul1_mult) { cb = 2; mult = mul1_mult; }
+
     int selected_shape;
     int block_dim;
     fp_exl3_mgemm_kernel kernel = select_exl3_mgemm_kernel
     (
         cc, size_m, size_k, size_n, K, c_fp32,
         force_shape_idx, &block_dim, &selected_shape,
-        &num_sms
+        &num_sms, cb
     );
     if (!kernel) return 0;
 
@@ -225,7 +249,11 @@ int exl3_mgemm
     dim3 block_grid(num_sms, 1, concurrency);
 
     // Launch
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    if (kernel_attr_set[device].find((void*)kernel) == kernel_attr_set[device].end())
+    {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        kernel_attr_set[device].insert((void*)kernel);
+    }
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -241,7 +269,8 @@ int exl3_mgemm
         (void*)& indices_ptr,
         (void*)& weights_ptr,
         (void*)& bszm_in,
-        (void*)& bszm_out
+        (void*)& bszm_out,
+        (void*)& mult
     };
 
     cudaLaunchCooperativeKernel

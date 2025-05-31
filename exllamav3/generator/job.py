@@ -14,6 +14,7 @@ import time
 from ..ext import exllamav3_ext as ext
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
+from ..util import profile_opt
 
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 def _strings_to_utf32(strings: list[str]) -> tuple[np.ndarray, np.ndarray] | None:
@@ -304,9 +305,9 @@ class Job:
     ):
         # TODO: (cfg)
         # assert logits.shape[0] == len(self.sequences) == (2 if self.gen_settings.cfg_scale is not None else 1)
-        assert logits.shape[0] == len(self.sequences)
-        assert self.is_prefill_done()
-        assert all(seq.live for seq in self.sequences)
+        # assert logits.shape[0] == len(self.sequences)
+        # assert self.is_prefill_done()
+        # assert all(seq.live for seq in self.sequences)
 
         # Start filters
         # TODO: (filters)
@@ -339,17 +340,18 @@ class Job:
             allowed_tokens = allowed_tokens,
         )
 
-        if self.return_probs:
-            # TODO
-            pass
-        else:
-            next_prob = None
+        next_prob, next_k_tokens, next_k_probs = None, None, None
 
-        if self.return_top_tokens:
-            # TODO
-            pass
-        else:
-            next_k_tokens, next_k_probs = None, None
+        if self.return_probs or self.return_top_tokens > 0:
+            probs = torch.softmax(logits.float(), dim = -1)
+
+            if self.return_probs:
+                next_prob = torch.gather(probs.squeeze(0), dim = 1, index = next_token)
+
+            if self.return_top_tokens > 0:
+                sorted_probs, sorted_indices = torch.sort(probs, dim = -1, descending = True)
+                next_k_tokens = sorted_indices[:, :, :self.return_top_tokens]
+                next_k_probs = sorted_probs[:, :, :self.return_top_tokens]
 
         return next_token, next_k_tokens, next_k_probs, next_prob
 

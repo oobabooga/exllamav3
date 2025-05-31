@@ -24,6 +24,7 @@ class Linear(Module):
         qmap: str | None = None,
         alt_key: str | None = None,
         qbits_key: str = "bits",
+        qbits_mod_key: str = "",
         fkey : str | None = None,
         frange: tuple[int, int] | None = None,
         caps: dict = None,
@@ -50,6 +51,7 @@ class Linear(Module):
         self.first_out_feature = first_out_feature if first_out_feature is not None else 0
         self.inner = None
         self.qbits_key = qbits_key
+        self.qbits_mod_key = qbits_mod_key
         self.fkey = fkey
         self.frange = frange
         self.quant_type = None
@@ -81,25 +83,28 @@ class Linear(Module):
         return padded.contiguous()
 
 
+    def apply_fp8_scales_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
+        ws = weight.shape
+        ss = scale_inv.shape
+        assert len(ws) == len(ss) == 2
+        assert all(w == s * 128 for w, s in zip(ws, ss))
+        weight = weight.view(ss[0], 128, ss[1], 128)
+        scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
+        weight *= scale_inv
+        return weight
+
+
     def load_fp16(self, key: str) -> bool:
         if self.config.stc.has_tensor_group(key, ["weight"]):
             self.used_alt_key = key == self.alt_key
-            weight = self.config.stc.get_tensor(
-                key + ".weight",
-                "cpu" if self.is_sliced else self.device,
-                float2half = True,
-                transpose = True,
-                pad_to = (self.in_features, self.out_features)
-            )
-            # weight = self.pad_out(weight)
-            bias = self.config.stc.get_tensor(
-                key + ".bias",
-                "cpu" if self.is_sliced else self.device,
-                float2half = True,
-                optional = True,
-                pad_to = (self.out_features,)
-            )
-            # bias = self.pad_out(bias)
+            dev = "cpu" if self.is_sliced else self.device
+            pad1 = (self.out_features,) if not self.is_sliced else None
+            pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
+            weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = True, pad_to = pad2)
+            bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1)
+            scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, float2half = True, optional = True)
+            if scale_inv is not None:
+                self.apply_fp8_scales_(weight, scale_inv)
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
@@ -156,6 +161,8 @@ class Linear(Module):
         sv = self.config.stc.get_tensor(key + ".sv", self.device, optional = True, no_defer = True)
         svh = self.config.stc.get_tensor(key + ".svh", self.device, optional = True)
         trellis = self.config.stc.get_tensor(key + ".trellis", self.device)
+        mcg = self.config.stc.get_tensor(key + ".mcg", "cpu", no_defer = True, optional = True)
+        mul1 = self.config.stc.get_tensor(key + ".mul1", "cpu", no_defer = True, optional = True)
         bias = self.config.stc.get_tensor(key + ".bias", self.device, optional = True)
         self.inner = LinearEXL3(
             self.config,
@@ -167,6 +174,8 @@ class Linear(Module):
             suh,
             svh,
             trellis,
+            mcg,
+            mul1,
             bias,
             self.out_dtype
         )
@@ -244,6 +253,8 @@ class Linear(Module):
             out_tensors.get("suh"),
             out_tensors.get("svh"),
             out_tensors.get("trellis"),
+            out_tensors.get("mcg"),
+            out_tensors.get("mul1"),
             orig_bias,
             self.out_dtype
         )

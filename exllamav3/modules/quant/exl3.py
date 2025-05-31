@@ -6,6 +6,7 @@ from ...util import first_not_none
 import math
 from .exl3_lib.quantize import preapply_had_l, preapply_had_r, had_k, had_n, tensor_core_perm, tensor_core_perm_i
 from ...ext import exllamav3_ext as ext
+from ...util import profile_opt
 
 class LinearEXL3:
 
@@ -20,8 +21,10 @@ class LinearEXL3:
         suh: torch.Tensor | None = None,
         svh: torch.Tensor | None = None,
         trellis: torch.Tensor | None = None,
+        mcg: torch.Tensor | None = None,
+        mul1: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
-        out_dtype: torch.dtype | None = None
+        out_dtype: torch.dtype | None = None,
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -48,6 +51,13 @@ class LinearEXL3:
         self.bias = bias
         self.swap_device = None
         self.out_dtype = out_dtype
+        self.mcg_mult = None
+
+        self.mcg = mcg
+        self.mcg_mult = mcg.view(torch.uint32).item() if mcg is not None else 0
+
+        self.mul1 = mul1
+        self.mul1_mult = mul1.view(torch.uint32).item() if mul1 is not None else 0
 
 
     def get_tensors(self, key: str):
@@ -59,6 +69,8 @@ class LinearEXL3:
         if self.svh is not None: t[f"{key}.svh"] = self.svh.contiguous()
         t[f"{key}.trellis"] = self.trellis.contiguous()
         if self.bias is not None: t[f"{key}.bias"] = self.bias.contiguous()
+        if self.mcg_mult: t[f"{key}.mcg"] = self.mcg
+        if self.mul1_mult: t[f"{key}.mul1"] = self.mul1
         return t
 
 
@@ -70,33 +82,29 @@ class LinearEXL3:
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         out_shape = x.shape[:-1] + (self.out_features,)
-        input_dtype = x.dtype
         x = x.view(-1, self.in_features)
 
         torch_mode = params.get("reconstruct", x.shape[0] > 32)
-
-        y = torch.empty(
-            (x.shape[0], self.out_features),
-            dtype = first_not_none(out_dtype, self.out_dtype, torch.half),
-            device = x.device
-        )
-
-        xh = torch.empty_like(x)
+        ret_dtype = out_dtype or self.out_dtype or torch.half
 
         if torch_mode:
+            y = torch.empty(out_shape, dtype = ret_dtype, device = x.device)
+            y_ = y.view(x.shape[0], self.out_features)
+            xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
             w = self.get_inner_weight_tensor()
-            ext.hgemm(xh, w, y)
-            ext.had_r_128(y, y, None, self.svh, 1.0)
+            # TODO: Test torch.matmul for Blackwell
+            ext.hgemm(xh, w, y_)
+            ext.had_r_128(y_, y_, None, self.svh, 1.0)
         else:
-            ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1)
-
-        x = y.view(out_shape)
+            y = torch.empty(out_shape, dtype = ret_dtype, device = x.device)
+            xh = torch.empty_like(x)
+            ext.exl3_gemm(x, self.trellis, y, self.suh, xh, self.svh, -1, self.mcg_mult, self.mul1_mult)
 
         if self.bias is not None:
-            x += self.bias
+            y += self.bias
 
-        return x
+        return y
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
@@ -123,8 +131,8 @@ class LinearEXL3:
 
 
     def get_inner_weight_tensor(self):
-        w = torch.zeros((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-        ext.reconstruct(w, self.trellis, self.K)
+        w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+        ext.reconstruct(w, self.trellis, self.K, self.mcg_mult, self.mul1_mult)
         return w
 
 

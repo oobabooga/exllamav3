@@ -1,5 +1,7 @@
 import torch
 from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
+from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2QuantLinear
+from gptqmodel.nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from aqlm import QuantizedLinear
 from awq.modules.linear import WQLinear_GEMM
@@ -85,15 +87,26 @@ def get_storage_info(model):
                 "scales": module.scales,
             })
             sum_numel += module.in_features * module.out_features
+        elif any(isinstance(module, x) for x in [TritonV2QuantLinear]):
+            sum_bits += get_tensors_size({
+                "g_idx": module.g_idx,
+                "qweight": module.qweight,
+                "qzeros": module.qzeros,
+                "scales": module.scales,
+            })
+            sum_numel += module.in_features * module.out_features
+        elif any(isinstance(module, x) for x in [ExllamaV2QuantLinear]):
+            sum_bits += get_tensors_size(module.q_tensors)
+            sum_numel += module.in_features * module.out_features
     vram_bits = head_numel * head_bpw + sum_bits
     return sum_bits / sum_numel, head_bpw, vram_bits
 
 @torch.inference_mode
-def load_transformers(model_dir: str, auto = False):
+def load_transformers(model_dir: str, auto = False, bf16 = False):
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         device_map = "auto" if auto else "cuda:0",
-        torch_dtype = torch.half
+        torch_dtype = torch.bfloat16 if bf16 else torch.half
     )
     bpw_layer, bpw_head, vram_bits = get_storage_info(model)
     return model, bpw_layer, bpw_head, vram_bits
@@ -101,6 +114,10 @@ def load_transformers(model_dir: str, auto = False):
 @torch.inference_mode
 def load_transformers_auto(model_dir: str):
     return load_transformers(model_dir, auto = True)
+
+@torch.inference_mode
+def load_transformers_auto_bf16(model_dir: str):
+    return load_transformers(model_dir, auto = True, bf16 = True)
 
 @torch.inference_mode
 def fwd_transformers(model_instance, input_ids: torch.Tensor):

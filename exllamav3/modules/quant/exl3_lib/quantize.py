@@ -53,6 +53,8 @@ def quantize_tiles(tiles, quant_args: dict):
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
+    mcg_mult = quant_args.get("mcg_mult", 0)
+    mul1_mult = quant_args.get("mul1_mult", 0)
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
     temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
@@ -62,7 +64,9 @@ def quantize_tiles(tiles, quant_args: dict):
         quantized_idx,
         temp_costs,
         temp_edges,
-        K
+        K,
+        mcg_mult,
+        mul1_mult,
     )
     return quantized_tiles, quantized_idx
 
@@ -142,6 +146,8 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
 
                 # Work buffers
                 K = quant_args["K"]
+                mcg_mult = quant_args.get("mcg_mult", 0)
+                mul1_mult = quant_args.get("mul1_mult", 0)
                 temp_costs, temp_edges = get_temp_buffers(device, K)
 
                 ext.quantize_tiles(
@@ -150,7 +156,9 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                     dev_q_idx,
                     temp_costs,
                     temp_edges,
-                    K
+                    K,
+                    mcg_mult,
+                    mul1_mult
                 )
 
                 # Async copy back to pinned memory
@@ -634,8 +642,9 @@ def regularize(
     sv: torch.Tensor,
     quant_args: dict,
     verbose: bool,
-    H_diag: torch.Tensor,
-    pb: ProgressBar
+    H_diag: torch.Tensor | None,
+    pb: ProgressBar | None,
+    skip_g_scale: bool = False
 ):
     force_out_scales = quant_args["apply_out_scales"]
 
@@ -652,17 +661,21 @@ def regularize(
     # the input to the linear layer is very irregular. After some testing, set the cutoff at 15% of the RMS sum
     # on 2% of the channels
     # TODO: More science
-    diag = H_diag.sqrt()
-    diag, _ = torch.sort(diag, descending = True)
-    cutoff = diag.shape[0] // 50
-    skew_factor = diag[:cutoff].sum() / diag.sum()
-    if verbose:
-        print(f"     - input state skew: {skew_factor.item():.6f}")
+    if H_diag is not None:
+        diag = H_diag.sqrt()
+        diag, _ = torch.sort(diag, descending = True)
+        cutoff = diag.shape[0] // 50
+        skew_factor = diag[:cutoff].sum() / diag.sum()
+        if verbose:
+            print(f"     - input state skew: {skew_factor.item():.6f}")
 
-    if force_out_scales is None:
-        apply_out_scales = skew_factor.item() < 0.15
+        if force_out_scales is None:
+            apply_out_scales = skew_factor.item() < 0.15
+        else:
+            apply_out_scales = force_out_scales
+
     else:
-        apply_out_scales = force_out_scales
+        apply_out_scales = True if force_out_scales is None else force_out_scales
 
     # Apply output scales
     if apply_out_scales:
@@ -687,7 +700,10 @@ def regularize(
     blockwise_preapply_had_l_(weight, had_k)
 
     # Determine best scale for matrix by test quantizing a sample of tiles along a wrapped diagonal
-    g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+    if not skip_g_scale:
+        g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
+    else:
+        g_scale = 1.0
     weight *= g_scale
     su /= g_scale
 
@@ -814,18 +830,25 @@ def quantize_exl3(
         pb.update(tiles_k)
 
         # Metrics
-        E = weight_r - weight_q  # may run on CPU
-        W = weight_r
-        Hd = H.to(device)
-        del weight_r
-        E = E.to(device)
-        num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
-        del E
-        W = W.to(device)
-        den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
-        del W
-        del Hd
-        proxy_err = num / max(den, 1e-8)
+        try:
+            E = weight_r - weight_q  # may run on CPU
+            W = weight_r
+            Hd = H.to(device)
+            weight_r = None
+            E = E.to(device)
+            num = torch.einsum("ik,ij,jk->", E, Hd, E).item()
+            E = None
+            W = W.to(device)
+            den = torch.einsum("ik,ij,jk->", W, Hd, W).item()
+            W = None
+            Hd = None
+            proxy_err = num / max(den, 1e-8)
+        except torch.OutOfMemoryError:
+            weight_r = None
+            E = None
+            W = None
+            Hd = None
+            proxy_err = -1.0
 
         # free_mem()
 
@@ -854,6 +877,17 @@ def quantize_exl3(
             "svh": svh,
             "trellis": trellis,
         }
+
+        mcg_mult = quant_args.get("mcg_mult", 0)
+        if mcg_mult:
+            out_tensors.update({
+                "mcg": torch.tensor(mcg_mult, dtype = torch.uint32).view(torch.int)
+            })
+        mcg_mult = quant_args.get("mul1_mult", 0)
+        if mcg_mult:
+            out_tensors.update({
+                "mul1": torch.tensor(mcg_mult, dtype = torch.uint32).view(torch.int)
+            })
 
         quant_args.update({
             "apply_out_scales": apply_out_scales,

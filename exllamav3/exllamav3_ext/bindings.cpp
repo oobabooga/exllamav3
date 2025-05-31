@@ -25,8 +25,13 @@
 #include "generator/sampling_basic.cuh"
 #include "generator/gumbel.cuh"
 #include "generator/rep_pen.cuh"
+#include "generator/cache.cuh"
 
 #include "cache/q_cache.cuh"
+
+#include "histogram.cuh"
+
+#include "libtorch/blocksparse_mlp.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -69,6 +74,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("apply_rep_pens", &apply_rep_pens, "apply_rep_pens");
     m.def("apply_pres_freq_pens", &apply_pres_freq_pens, "apply_pres_freq_pens");
 
+    m.def("cache_rotate", &cache_rotate, "cache_rotate");
+
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
     m.def("count_match_tensor", &count_match_tensor, "count_match_tensor");
 
@@ -78,4 +85,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dequant_cache_paged", &dequant_cache_paged, "dequant_cache_paged");
 
     m.def("count_inf_nan", &count_inf_nan, "count_inf_nan");
+    m.def("histogram", &histogram, "histogram");
+
+    m.def("blocksparse_mlp_routing", &blocksparse_mlp_routing, "blocksparse_mlp_routing");
 }

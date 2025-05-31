@@ -9,12 +9,16 @@ from ..util.progress import ProgressBar
 from ..util.memory import free_mem
 from ..util import Timer, human_time
 from ..util.tensor import save_tensor_image
+from ..util.measures import cosine_error, sqnr
 from .calibration_data import get_default_calibration
 from .compile import compile_model, dsize
 from safetensors.torch import save_file
 from safetensors import safe_open
 import os, shutil
 import json
+
+col_default = "\u001b[0m"
+col_red = "\u001b[31;1m"
 
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 200)
 
@@ -34,6 +38,9 @@ parser.add_argument("-v", "--verbose", action = "store_true", help = "Verbose mo
 parser.add_argument("-d", "--devices", type = str, default = "0", help = "List of devices to use for quantization, e.g. --devices 0,1,2")
 parser.add_argument("-dr", "--device_ratios", type = str, default = "", help = "Split ratio for devices, e.g. --device_ratio 2,2,4")
 parser.add_argument("-img", "--image_dump", action = "store_true", help = "Save model tensors as images (saved to working directory)")
+parser.add_argument("-mcg", "--mcg_multiplier", type = str, default = None, help = "MCG multiplier - EXPERIMENTAL, DO NOT USE")
+parser.add_argument("-mul1", "--mul1_multiplier", type = str, default = None, help = "MUL1 multiplier - EXPERIMENTAL, DO NOT USE")
+parser.add_argument("-strat", "--strategy", type = str, default = None, help = "Modifiers for quantization strategy - EXPERIMENTAL")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--out_scales", dest = "out_scales_", action = "store_true", help = "Always enable out channel scales  (for debug purposes)")
@@ -96,13 +103,15 @@ def prepare_env(args):
     os.makedirs(images_dir, exist_ok = True)
 
 
-def prepare(args) -> (dict, bool, str, str):
+def prepare(args) -> (dict, dict, bool, str):
     if not args.work_dir:
         return None, None, False, "Must specify --work_dir"
     if not args.in_dir and not args.resume:
         return None, None, False, "Specify either --in_dir to start a new job or --resume to resume an interrupted job"
     if not args.out_dir and not args.resume:
         return None, None, False, "Must specify --out_dir or --resume"
+    if args.mcg_multiplier and args.mul1_multiplier:
+        return None, None, False, "Cannot specify both MCG and MUL1 arguments"
 
     in_args = { "work_dir": args.work_dir }
     if args.resume:
@@ -144,6 +153,9 @@ def prepare(args) -> (dict, bool, str, str):
         ("last_checkpoint_index", True, -1),
         ("devices", True, None),
         ("device_ratios", True, None),
+        ("mcg_multiplier", True, ""),
+        ("mul1_multiplier", True, ""),
+        ("strategy", False, ""),
     ]:
         override(arg_, can_override if not args.override_anyway else True, default)
 
@@ -164,12 +176,25 @@ def prepare(args) -> (dict, bool, str, str):
         save_dict("args.json", in_args, in_args)
         save_dict("ckpt/job.json", job_state, in_args)
 
+    warn_experimental = False
     print(f"    Input directory: {in_args['in_dir']}")
     print(f"    Output directory: {in_args['out_dir']}")
     print(f"    Working directory: {in_args['work_dir']}")
     print(f"    Calibration size: {in_args['cal_rows']} rows, {in_args['cal_cols']} columns")
     print(f"    Target bitrate: {in_args['bits']} (decoder), {in_args['head_bits']} (head)")
     print(f"    Output scales: " + {True: "always", False: "never", None: "auto"}[in_args["apply_out_scales"]])
+    if in_args.get("mcg_multiplier"):
+        warn_experimental = True
+        print(f"    {col_red}MCG multiplier (experimental): {in_args.get('mcg_multiplier')} {col_default}")
+    if in_args.get("mul1_multiplier"):
+        warn_experimental = True
+        print(f"    {col_red}MUL1 multiplier (experimental): {in_args.get('mul1_multiplier')} {col_default}")
+
+    if warn_experimental:
+        print(
+            f" !! {col_red}WARNING, experimental options are selected. The quantized model may not work in future "
+            f"versions of ExLlamaV3 {col_default}"
+        )
 
     return in_args, job_state, True, None
 
@@ -205,7 +230,35 @@ def get_state_error(x, ref):
      x = x.view(-1, x.shape[-1]).float()
      ref = ref.view(-1, ref.shape[-1]).float()
      err = torch.linalg.norm(x - ref, 'fro') / torch.linalg.norm(ref, 'fro')
-     return err.item()
+     sq = sqnr(x, ref)
+     cos = cosine_error(x, ref)
+     return err.item(), cos, sq
+
+
+def mod_strategy(args, module, strategy, idx):
+    mod_arg = args.get("strategy")
+    if not mod_arg:
+        return strategy
+
+    s_layers = [""] + mod_arg.split(";")
+    if idx >= len(s_layers):
+        return strategy
+
+    s = s_layers[idx]
+    mod = {}
+    while s:
+        l, m = s[0], s[1]
+        s = s[2:]
+        mod[l] = int(m)
+
+    new_strategy = {}
+    for key, bits in strategy.items():
+        submodule = module.find_module(key)
+        modifier = mod.get(submodule.qbits_mod_key, 0)
+        new_strategy[key] = min(bits + modifier, 8)
+
+    # TODO: Automate this, also calculate overall increase in bitrate, track in job.json across resumes
+    return new_strategy
 
 
 @torch.inference_mode()
@@ -256,6 +309,7 @@ def main(args, job_state):
             },
             job_state["surplus_bits"],
         )
+        strategy = mod_strategy(args, module, strategy, idx)
         job_state["surplus_bits"] = surplus
 
         # Slice module if necessary
@@ -348,6 +402,15 @@ def main(args, job_state):
                     "device_ratios": device_ratios,
                     "apply_out_scales": args["apply_out_scales"],
                 }
+                if args.get("mcg_multiplier"):
+                    quant_args.update({
+                        "mcg_mult": int(args["mcg_multiplier"], 0)
+                    })
+                if args.get("mul1_multiplier"):
+                    quant_args.update({
+                        "mul1_mult": int(args["mul1_multiplier"], 0)
+                    })
+
                 with Timer() as t:
                     sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                         if args["image_dump"] else None
@@ -361,10 +424,11 @@ def main(args, job_state):
                     assert isinstance(linear.inner, LinearEXL3)
                     linear.inner.swap_cpu()
                 flags = "o" if quant_args["apply_out_scales"] else "."
+                proxy_err_str = f"{proxy_err:8.6f}" if proxy_err >= 0.0 else "(OoM)   "
                 print(
                     f" -- Quantized: {linear.key:{config.stc.max_key_len() + 8}}"
                     f"  bpw: {quant_args['K']:5.2f}"
-                    f"  proxy_err: {proxy_err:8.6f}"
+                    f"  proxy_err: {proxy_err_str}"
                     f"  {flags}"
                     f"  g_sc: {quant_args['g_scale']:.6f}"
                     f"  [{t.interval:4.2f} s]"
@@ -377,6 +441,7 @@ def main(args, job_state):
 
             # Unload module
             module.unload()
+            config.stc.close()
 
         # Save layer tensors to working directory
         save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
@@ -397,6 +462,8 @@ def main(args, job_state):
 
         # Advance state
         error = 0
+        cos_error = 0
+        sqnr_ = 0
         with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
             for i in range(len(state)):
                 progress.update(i)
@@ -408,16 +475,23 @@ def main(args, job_state):
                     state[i] = module.forward(state[i], params).cpu()
                 if i < num_ref_states and len(linears):
                     ref_states[i] = ref_states[i].to(state[i].device)
-                    error += get_state_error(state[i], ref_states[i])
+                    rfn, cos, sq = get_state_error(state[i], ref_states[i])
+                    error += rfn
+                    cos_error += cos
+                    sqnr_ += sq
                     ref_states[i] = None
         error /= num_ref_states
+        cos_error /= num_ref_states
+        sqnr_ /= num_ref_states
 
         # Feedback after module
         module_time = time.time() - start_module_time
         print(
             f" -- Quantized: {module.key:{config.stc.max_key_len() + 8}}" +
             (f"  bpw: {final_bpw:5.2f}" if final_bpw else f"   no_weights") +
-            (f"        rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+            (f"  rfn: {error:.6f}" if module.num_slices == 1 else "        rfn: N/A     ") +
+            f"  cos: {cos_error:.6f}"
+            f"  sqnr: {sqnr_:.6f}"
             f"  [{module_time:.2f} s]"
         )
         sys.stdout.flush()

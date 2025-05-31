@@ -5,6 +5,7 @@ import argparse
 from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
+from exllamav3.util.measures import cosine_error, sqnr
 from exllamav3 import Config, Model, Tokenizer
 from datasets import load_dataset
 import torch
@@ -40,6 +41,8 @@ def get_test_tokens(tokenizer, rows, eval_len = 2048, eval_stride = 512):
 @torch.inference_mode()
 def main(args):
 
+    device = torch.device(args.device)
+
     config_a = Config.from_directory(args.model_a)
     config_a.override_dynamic_seq_len(2048)
     tokenizer = Tokenizer.from_config(config_a)
@@ -56,18 +59,24 @@ def main(args):
 
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
-        module_a.load("cuda:0" if not module_a.caps.get("prefer_cpu") else "cpu")
+        config_a.stc.begin_deferred_load()
+        module_a.load(device if not module_a.caps.get("prefer_cpu") else "cpu")
+        config_a.stc.end_deferred_load()
         params_a = {}
         state_a = module_a.prepare_for_device(state_a, params_a)
         state_a = module_a.forward(state_a, params_a)
         module_a.unload()
+        config_a.stc.close()
         free_mem()
 
-        module_b.load("cuda:0" if not module_b.caps.get("prefer_cpu") else "cpu")
+        config_b.stc.begin_deferred_load()
+        module_b.load(device if not module_b.caps.get("prefer_cpu") else "cpu")
+        config_b.stc.end_deferred_load()
         params_b = {}
         state_b = module_b.prepare_for_device(state_b, params_b)
         state_b = module_b.forward(state_b, params_b)
         module_b.unload()
+        config_b.stc.close()
         free_mem()
 
         if idx < args.keep_b:
@@ -75,10 +84,14 @@ def main(args):
 
         max_diff = 0
         rfn_error_sum = 0
+        cos_error_sum = 0
+        sqnr_sum = 0
         rows = state_a.shape[0]
         for i in range(rows):
             sa = state_a[i].to(float, copy = True)
             sb = state_b[i].to(float)
+            cos_error_sum += cosine_error(sa, sb)
+            sqnr_sum += sqnr(sa, sb)
             sa -= sb
             rfn_error_sum += (torch.linalg.norm(sa, 'fro') / torch.linalg.norm(sb, 'fro').mean()).item()
             sa.abs_()
@@ -87,7 +100,15 @@ def main(args):
 
         del sa, sb
         rfn_error = rfn_error_sum / rows
-        print(f" -- {module_a.key:40}   error: {rfn_error:.6f}   max_diff/norm: {max_diff:.6f}")
+        cos_error = cos_error_sum / rows
+        sqnr_ = sqnr_sum / rows
+        print(
+            f" -- {module_a.key:40}"
+            f"   rfn_err: {rfn_error:.6f}"
+            f"   max_diff/norm: {max_diff:.6f}"
+            f"   sqnr: {sqnr_:9.6f}"
+            f"   cos_err: {cos_error:.6f}"
+        )
 
     # Compare logits
     topk_max = args.topk_max
@@ -193,6 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rows", type = int, help = "Number of rows", default = 100)
     parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
     parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
+    parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
 
     _args = parser.parse_args()
     main(_args)

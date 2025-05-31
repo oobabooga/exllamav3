@@ -6,11 +6,14 @@ from torch import nn
 from ..models import Config
 from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2
-from . import Module, Linear, RMSNorm
+from . import Module, Linear, RMSNorm, LayerNorm
 from ..device import get_device_context, release_device_context
 from ..constants import PAGE_SIZE
 from ..cache import Cache
 from flash_attn import flash_attn_func, flash_attn_with_kvcache
+from ..util import profile_opt
+from .multilinear import MultiLinear
+from ..ext import exllamav3_ext as ext
 
 """
 SDPA:
@@ -144,8 +147,8 @@ class Attention(Module):
         out_dtype: torch.dtype | None = None,
         sliding_window: int  = -1,
         logit_softcapping: float = 0.0,
-        q_norm: RMSNorm | None = None,
-        k_norm: RMSNorm | None = None,
+        q_norm: RMSNorm | LayerNorm | None = None,
+        k_norm: RMSNorm | LayerNorm | None = None,
     ):
         super().__init__(config, key, None)
 
@@ -171,10 +174,10 @@ class Attention(Module):
         else:
             fkey, frange_q, frange_k, frange_v = None, None, None, None
 
-        self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q)
-        self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k)
-        self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v)
-        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype)
+        self.q_proj = Linear(config, f"{key}.{key_q}", hidden_size, num_q_heads * head_dim, qmap = qmap + ".input", fkey = fkey, frange = frange_q, qbits_mod_key = "q")
+        self.k_proj = Linear(config, f"{key}.{key_k}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_k, qbits_mod_key = "k")
+        self.v_proj = Linear(config, f"{key}.{key_v}", hidden_size, num_kv_heads * head_dim, qmap =  qmap + ".input", fkey = fkey, frange = frange_v, qbits_mod_key = "v")
+        self.o_proj = Linear(config, f"{key}.{key_o}", num_q_heads * head_dim, hidden_size, qmap =  qmap + ".o", out_dtype = out_dtype, qbits_mod_key = "o")
 
         self.register_submodule(self.q_proj)
         self.register_submodule(self.k_proj)
@@ -187,15 +190,28 @@ class Attention(Module):
             self.k_norm = k_norm
             self.register_submodule(self.q_norm)
             self.register_submodule(self.k_norm)
+            if isinstance(q_norm, RMSNorm):
+                self.norm_eps = q_norm.rms_norm_eps
+                self.norm_constant_bias = q_norm.constant_bias
+                assert self.norm_eps == k_norm.rms_norm_eps
+            else:
+                self.norm_eps = q_norm.layernorm_eps
+                self.norm_constant_bias = 0.0
         else:
             self.q_norm = None
             self.k_norm = None
+            self.norm_eps = 1e-6
+            self.norm_constant_bias = 0.0
 
         self.caps.update({
             "kv_cache": True
         })
 
         self.cache_layers = []
+        self.multi_kv = None
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
 
 
     @override
@@ -212,10 +228,21 @@ class Attention(Module):
                 self.rope_settings,
             )
 
-        # self.join_qkv_fwd = (
-        #     (self.q_proj.quant_type, self.k_proj.quant_type, self.v_proj.quant_type)
-        #     == ("exl3", "exl3", "exl3")
-        # )
+        # Test if K and V proj can be fused
+        if (
+            self.k_proj.quant_type == "exl3" and
+            self.v_proj.quant_type == "exl3" and
+            self.k_proj.out_features == self.v_proj.out_features and
+            self.k_proj.inner.K == self.v_proj.inner.K and
+            self.k_proj.inner.bias is None and
+            self.v_proj.inner.bias is None
+        ):
+            self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
+
+        # Head norm
+        if self.q_norm and isinstance(self.q_norm, RMSNorm):
+            self.q_norm_tensor = self.q_norm.weight.data
+            self.k_norm_tensor = self.k_norm.weight.data
 
 
     @override
@@ -227,6 +254,13 @@ class Attention(Module):
             cl.free()
 
         self.rope = None
+
+        if self.multi_kv is not None:
+            self.multi_kv.unload()
+            self.multi_kv = None
+
+        self.q_norm_tensor = None
+        self.k_norm_tensor = None
 
 
     @override
@@ -253,9 +287,34 @@ class Attention(Module):
 
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
+        bsz, q_len, dim = x.shape
         q = self.q_proj.forward(x, params)
-        k = self.k_proj.forward(x, params)
-        v = self.v_proj.forward(x, params)
+
+        if self.multi_kv is None or bsz * q_len > 32:
+            k = self.k_proj.forward(x, params)
+            v = self.v_proj.forward(x, params)
+
+        else:
+            x = x.view(1, bsz * q_len, dim)
+            kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+            kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+            ext.exl3_mgemm(
+                x,
+                self.multi_kv.ptrs_trellis,
+                kv,
+                self.multi_kv.ptrs_suh,
+                kvh,
+                self.multi_kv.ptrs_svh,
+                None,
+                None,
+                self.multi_kv.K,
+                -1,
+                self.multi_kv.mcg_mult,
+                self.multi_kv.mul1_mult,
+            )
+            k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+            v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+
         return q, k, v
 
 
@@ -287,12 +346,22 @@ class Attention(Module):
         assert self.logit_softcapping == 0.0, \
             "Torch SDPA does not support logit softcapping"
 
-        if self.q_norm:
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(q, k, position, positions, position_ids)
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias
+            )
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -321,12 +390,22 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        if self.q_norm:
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias
+            )
 
         o = flash_attn_func(
             q = q,
@@ -341,6 +420,7 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
 
 
     def decode_flash_attn(
@@ -363,12 +443,23 @@ class Attention(Module):
         k = k.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.num_kv_heads, self.head_dim)
 
-        if self.q_norm:
+        # TODO: Add LayerNorm option to fused norm/RoPE kernel
+        if self.q_norm and (not self.rope or self.q_norm_tensor is None):
             q = self.q_norm.forward(q, params, out_dtype = torch.half)
             k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(q, k, position, positions, position_ids, in_place = True)
+            q, k = self.rope.apply(
+                q, k,
+                position,
+                positions,
+                position_ids,
+                True,
+                self.q_norm_tensor,
+                self.k_norm_tensor,
+                self.norm_eps,
+                self.norm_constant_bias
+            )
 
         cache_k, cache_v = cache.get_layer(self.layer_idx, cache_seqlens, block_table)
         o = flash_attn_with_kvcache(

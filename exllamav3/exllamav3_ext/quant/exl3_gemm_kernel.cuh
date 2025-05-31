@@ -35,8 +35,8 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
-        (A_, B, C_, size_m_, size_k, size_n, locks);
+        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+        (A_, B, C_, size_m_, size_k, size_n, locks, mult);
 
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
@@ -89,7 +89,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         if (j >= bszm) j = -1;
         else
         {
-            mat_index = (int) B_indices[j];
+            mat_index = B_indices ? (int) B_indices[j] : j;
             B = B_list[mat_index];
         }
 
@@ -130,10 +130,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             if (B)
             {
                 int lock_offs = blockIdx.z * size_n / 128;
+
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
-                (A_, B, C_, size_m_, size_k, size_n, locks + lock_offs);
-            }
+                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES>
+                (A_, B, C_, size_m_, size_k, size_n, locks + lock_offs, mult);
+             }
 
             A_ += 16 * size_k;
             if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
@@ -181,5 +182,42 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         }
 
         cg::this_grid().sync();
+    }
+
+    // Final reduction
+    if (B_weights && blockIdx.z == 0)
+    {
+        int total_warps = size_m * size_n / 32;
+        int warps_grid = gridDim.x * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+        int this_lane = threadIdx.x % 32;
+
+        for(; this_warp < total_warps; this_warp += warps_grid)
+        {
+            if constexpr (c_fp32)
+            {
+                float* C__ = ((float*) C) + this_warp * 32 + this_lane;
+                float* C___ = C__;
+                float sum = *C___;
+                for (int j = 1; j < bszm; ++j)
+                {
+                    C___ += size_m * size_n;
+                    sum += *C___;
+                }
+                *C__ = sum;
+            }
+            else
+            {
+                half* C__ = ((half*) C) + this_warp * 32 + this_lane;
+                half* C___ = C__;
+                half sum = *C___;
+                for (int j = 1; j < bszm; ++j)
+                {
+                    C___ += size_m * size_n;
+                    sum = __hadd(sum, *C___);
+                }
+                *C__ = sum;
+            }
+        }
     }
 }
