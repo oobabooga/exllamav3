@@ -23,13 +23,25 @@ def convert_dtype(dt: str):
         raise ValueError(f"Unknown dtype {dt}")
 
 
+tensor_name_fixes = {
+    "multi_modal_projector.mm_input_projection_weight": "multi_modal_projector.mm_input_projection.weight",
+}
+
+
 def read_header(filename: str) -> dict:
     with open(filename, "rb") as fp:
         header_size = np.fromfile(fp, dtype = np.int64, count = 1).item()
         header_json = fp.read(header_size)
         header = json.loads(header_json.decode("utf-8"))
         header["_header_offset"] = fp.tell()
-        return header
+    bad_keys = []
+    for k, v in header.items():
+        if k in tensor_name_fixes:
+            bad_keys.append((k, v))
+    for k, v in bad_keys:
+        del header[k]
+        header[tensor_name_fixes[k]] = v
+    return header
 
 
 @dataclass
@@ -101,6 +113,8 @@ class SafetensorsCollection:
             for key in header.keys():
                 if key in ["__metadata__", "_header_offset"]:
                     continue
+                if key in tensor_name_fixes:
+                    key = tensor_name_fixes[key]
                 if key in self.tensor_file_map and warn_if_override:
                     # print(f" !! Overriding {key} from {self.tensor_file_map[key]} with f{st_file}")
                     overrides += 1
@@ -174,6 +188,7 @@ class SafetensorsCollection:
     def list_tensors(
         self,
         prefix: str,
+        only_serializable: bool = False
     ) -> dict:
         assert self.new_tensors is None  # TODO
         keys = [
@@ -190,12 +205,13 @@ class SafetensorsCollection:
             results[key] = {
                 "shape": h["shape"],
                 "n_bytes": end - beg,
-                "dtype": str(dtype),
+                "dtype": str(dtype)
             }
+            if not only_serializable:
+                results[key]["torch_dtype"] = dtype
         return results
 
 
-    # TODO: deferred load
     def get_tensors(
         self,
         prefix: str,
@@ -211,7 +227,6 @@ class SafetensorsCollection:
         return result
 
 
-    # TODO: deferred load
     def get_tensor(
         self,
         key: str,

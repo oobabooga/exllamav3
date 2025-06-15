@@ -15,12 +15,12 @@ class TransformerBlock(Module):
         self,
         config: Config,
         key: str,
-        attn_norm: RMSNorm | None = None,
+        attn_norm: RMSNorm | LayerNorm | None = None,
         attn: Attention | None = None,
-        attn_post_norm: RMSNorm | None = None,
+        attn_post_norm: RMSNorm | LayerNorm | None = None,
         mlp_norm: RMSNorm | LayerNorm | None = None,
         mlp: MLP | GatedMLP | BlockSparseMLP | None = None,
-        mlp_post_norm: RMSNorm | None = None,
+        mlp_post_norm: RMSNorm | LayerNorm | None = None,
         qmap: str | None = None,
         qbits_key: str = "bits",
         out_dtype: torch.dtype = None
@@ -77,6 +77,13 @@ class TransformerBlock(Module):
     def allocate_q(self, quant_args: dict, surplus_bits: int):
         if not self.attn and not self.mlp:
             return {}, surplus_bits
+        g = self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None
+        u = self.mlp.ups if self.mlp else None
+        d = self.mlp.downs if self.mlp else None
+        if self.mlp and isinstance(self.mlp, BlockSparseMLP) and self.mlp.shared_experts:
+            g = g + self.mlp.shared_experts.gates
+            u = u + self.mlp.shared_experts.ups
+            d = d + self.mlp.shared_experts.downs
         return allocate_transformer(
             quant_args[self.qbits_key],
             surplus_bits,
@@ -84,11 +91,10 @@ class TransformerBlock(Module):
             self.attn.k_proj if self.attn else None,
             self.attn.v_proj if self.attn else None,
             self.attn.o_proj if self.attn else None,
-            self.mlp.gates if any(isinstance(self.mlp, x) for x in [GatedMLP, BlockSparseMLP]) else None,
-            self.mlp.ups if self.mlp else None,
-            self.mlp.downs if self.mlp else None,
+            g,
+            u,
+            d,
         )
-
 
     def get_name(self):
         name = super().get_name()

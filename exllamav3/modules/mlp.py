@@ -17,22 +17,48 @@ class MLP(Module):
         key: str,
         hidden_size: int,
         intermediate_size: int,
+        out_size: int | None = None,
         key_up: str | None = None,
         key_down: str | None = None,
         key_fused_gate_up: str | None = None,
         qmap: str | None = None,
-        out_dtype: torch.dtype = None
+        out_dtype: torch.dtype = None,
+        activation_fn: str = "silu",
+        pad_to = 128,
     ):
         super().__init__(config, key, None)
         assert key_fused_gate_up is None
 
         self.out_dtype = out_dtype
 
-        self.up = Linear(config, f"{key}.{key_up}", hidden_size, intermediate_size, qmap = qmap + ".up", qbits_mod_key = "u")
-        self.down = Linear(config, f"{key}.{key_down}", intermediate_size, hidden_size, qmap = qmap + ".down", qbits_mod_key = "d")
+        self.up = Linear(
+            config,
+            f"{key}.{key_up}",
+            hidden_size,
+            intermediate_size,
+            qmap = qmap + ".up",
+            qbits_mod_key = "u",
+            pad_to = pad_to
+        )
+        self.down = Linear(
+            config,
+            f"{key}.{key_down}",
+            intermediate_size,
+            hidden_size if out_size is None else out_size,
+            qmap = qmap + ".down",
+            qbits_mod_key = "d",
+            pad_to = pad_to
+        )
 
         self.register_submodule(self.up)
         self.register_submodule(self.down)
+
+        self.activation_fn = activation_fn
+
+        match activation_fn:
+            case "silu": self.activation_fn_call = F.silu
+            case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+
 
     @override
     def forward(
@@ -43,7 +69,7 @@ class MLP(Module):
     ) -> torch.Tensor:
 
         x = self.up.forward(x, params)
-        x = F.silu(x)
+        x = self.activation_fn_call(x)
         x = self.down.forward(x, params)
 
         return to2(x, out_dtype, self.out_dtype)
@@ -66,6 +92,7 @@ class GatedMLP(Module):
         activation_fn: str = "silu",
         intermediate_split_size: int | None = MAX_MLP_INTERMEDIATE,
         interm_dtype: torch.dtype = None,
+        pad_to = 128,
     ):
         super().__init__(config, key, None)
 
@@ -130,7 +157,8 @@ class GatedMLP(Module):
                 frange = frange_gate,
                 alt_key = a_key_g,
                 out_dtype = self.interm_dtype,
-                qbits_mod_key = "g"
+                qbits_mod_key = "g",
+                pad_to = pad_to
             )
             up = Linear(
                 config = config,
@@ -146,7 +174,8 @@ class GatedMLP(Module):
                 frange = frange_up,
                 alt_key = a_key_u,
                 out_dtype = self.interm_dtype,
-                qbits_mod_key = "u"
+                qbits_mod_key = "u",
+                pad_to = pad_to
             )
             down = Linear(
                 config = config,
@@ -161,7 +190,8 @@ class GatedMLP(Module):
                 alt_key = a_key_d,
                 out_dtype = self.out_dtype,
                 allow_input_padding = True,
-                qbits_mod_key = "d"
+                qbits_mod_key = "d",
+                pad_to = pad_to
             )
 
             self.ups.append(up)

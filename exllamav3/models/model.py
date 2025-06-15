@@ -21,6 +21,7 @@ class Model:
         self.config = config
 
         self.modules = []
+        self.caps = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -65,7 +66,7 @@ class Model:
         """
 
         assert component in config.model_classes, \
-            f"{config.architecture} does not define a '{component}` component model"
+            f"{config.architecture} does not define a '{component}' component model"
 
         model = config.model_classes[component](config, **kwargs)
         return model
@@ -93,6 +94,8 @@ class Model:
             params = {}
         x = self.prepare_inputs(input_ids, params)
         for idx, module in enumerate(self.modules):
+            if module.caps.get("logits_output") and (num := params.get("last_tokens_only")):
+                x = x[..., -num:, :].contiguous()
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
@@ -116,6 +119,14 @@ class Model:
                 progress.update(idx + 1)
 
 
+    def default_load_shape_dtype(self, chunk_size):
+        return (1, chunk_size), torch.long
+
+
+    def default_load_params(self):
+        return {}
+
+
     # Load with split
     def _load_autosplit(
         self,
@@ -127,14 +138,14 @@ class Model:
         max_output_size: int,
         max_output_factor: int,
         callback_sync: Callable[[int, int], None],
-        generator: bool
+        generator: bool,
     ):
         current_device_i = 0
-        backup_shape = (1, max_chunk_size)
-        backup_dtype = torch.long
+        backup_shape, backup_dtype = self.default_load_shape_dtype(max_chunk_size)
         dummy_state = None
         prev_load_device = None
         touched_devices = []
+        params = self.default_load_params()
 
         with ProgressBar(f"Loading" if progressbar else None, len(self.modules)) as progress:
 
@@ -185,8 +196,8 @@ class Model:
                             self.config.stc.end_deferred_load()
 
                         # Forward dummy state through module
-                        dummy_state = module.prepare_for_device(dummy_state, {})
-                        dummy_state = module.forward(dummy_state, {})
+                        dummy_state = module.prepare_for_device(dummy_state, params)
+                        dummy_state = module.forward(dummy_state, params)
 
                         # Account for max_output_factor after last layer,
                         if is_logits_layer:
@@ -440,3 +451,11 @@ class Model:
     @staticmethod
     def get_additional_compiled_tensors(config: Config):
         return {}
+
+
+    def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
+        """
+        Convenience function for formatting a single chat request with the default template associated with the
+        model's architecture, to simplify example and test scripts. Doesn't consider the model's actual Jinja template.
+        """
+        raise NotImplementedError

@@ -12,7 +12,7 @@ class LinearEXL3:
 
     def __init__(
         self,
-        config: Config,
+        config: Config | None,
         in_features: int,
         out_features: int,
         scale: torch.Tensor | None = None,
@@ -25,6 +25,7 @@ class LinearEXL3:
         mul1: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
+        transformers_fix: bool = False
     ):
         assert scale is None, "scale is no longer used"
         assert su is not None or suh is not None, "either su (packed) or suh (unpacked) is required"
@@ -38,6 +39,8 @@ class LinearEXL3:
         assert len(trellis.shape) == 3, "trellis must have dim = 3"
 
         if bias is not None and bias.dtype == torch.float: bias = bias.to(torch.half)
+
+        self.transformers_fix = transformers_fix
 
         # self.scale = scale.item()
         self.su = None
@@ -61,17 +64,19 @@ class LinearEXL3:
 
 
     def get_tensors(self, key: str):
-        t = {}
-        # t[f"{key}.scale"] = torch.tensor([self.scale], dtype = torch.float, device = self.su.device)
-        if self.su is not None: t[f"{key}.su"] = self.su.contiguous()
-        if self.suh is not None: t[f"{key}.suh"] = self.suh.contiguous()
-        if self.sv is not None: t[f"{key}.sv"] = self.sv.contiguous()
-        if self.svh is not None: t[f"{key}.svh"] = self.svh.contiguous()
-        t[f"{key}.trellis"] = self.trellis.contiguous()
-        if self.bias is not None: t[f"{key}.bias"] = self.bias.contiguous()
-        if self.mcg_mult: t[f"{key}.mcg"] = self.mcg
-        if self.mul1_mult: t[f"{key}.mul1"] = self.mul1
-        return t
+        return {
+            f"{key}.{subkey}": tensor.contiguous()
+            for subkey, tensor in [
+                ("su", self.su),
+                ("sv", self.sv),
+                ("suh", self.suh),
+                ("svh", self.svh),
+                ("trellis", self.trellis),
+                ("bias", self.bias),
+                ("mcg", self.mcg),
+                ("mul1", self.mul1),
+            ] if tensor is not None
+        }
 
 
     def forward(
@@ -93,7 +98,6 @@ class LinearEXL3:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
             w = self.get_inner_weight_tensor()
-            # TODO: Test torch.matmul for Blackwell
             ext.hgemm(xh, w, y_)
             ext.had_r_128(y_, y_, None, self.svh, 1.0)
         else:
@@ -108,13 +112,18 @@ class LinearEXL3:
 
 
     def unpack_bf(self, bitfield: torch.Tensor):
+        # For some reason this operation causes a GPU assert on Transformers. Running on CPU seems to fix it
+        device = bitfield.device
+        if self.transformers_fix:
+            bitfield = bitfield.cpu()
+
         # TODO: Maybe custom kernel for this. Only used for full reconstruct and loading old models, not during inference
         bitfield = bitfield.view(torch.uint16).to(torch.int)
         masks = (1 << torch.arange(16)).to(bitfield.device)
         expanded = (bitfield.unsqueeze(-1) & masks) > 0
         expanded = expanded.flatten()
         expanded = torch.where(expanded, torch.tensor(-1.0, dtype = torch.float16), torch.tensor(1.0, dtype = torch.float16))
-        return expanded.contiguous()
+        return expanded.contiguous().to(device)
 
 
     def get_weight_tensor(self):
