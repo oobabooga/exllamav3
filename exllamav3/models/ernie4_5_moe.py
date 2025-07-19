@@ -4,21 +4,20 @@ import torch
 from .config import Config, no_default
 from .model import Model
 from ..util.rope import RopeSettings, RopeStyle
-from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
+from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.attn import prepare_for_attn
 
-class LlamaConfig(Config):
-    arch_string = "LlamaForCausalLM"
+class Ernie4_5MoEConfig(Config):
+    arch_string = "Ernie4_5_MoeForCausalLM"
 
     def __init__(
         self,
         directory: str,
-        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            derived_model if derived_model else {"text": LlamaModel},
+            {"text": Ernie4_5MoEModel},
             **kwargs
         )
 
@@ -34,6 +33,13 @@ class LlamaConfig(Config):
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
+        self.assert_cfg(str, "moe_gate_act", "softmax", True)
+        self.num_shared_experts = self.read_cfg(int, "moe_num_shared_experts", 0)
+        self.moe_intermediate_size = self.read_cfg(int, "moe_intermediate_size", no_default)
+        self.num_experts = self.read_cfg(int, "moe_num_experts", no_default)
+        self.num_experts_per_tok = self.read_cfg(int, "moe_k", no_default)
+        self.first_k_dense_replace = self.read_cfg(int, "moe_layer_start_index", 0)
+        self.assert_cfg(int, "moe_layer_interval", 1, True)
 
         # Norms
         self.rms_norm_eps = self.read_cfg(float, "rms_norm_eps", no_default)
@@ -43,15 +49,15 @@ class LlamaConfig(Config):
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
 
 
-class LlamaModel(Model):
-    config_class = LlamaConfig
+class Ernie4_5MoEModel(Model):
+    config_class = Ernie4_5MoEConfig
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: Ernie4_5MoEConfig,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -90,24 +96,63 @@ class LlamaModel(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
+                    qmap = "block.attn"
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
                 ),
-                mlp = GatedMLP(
-                    config = config,
-                    key = f"model.layers.{idx}.mlp",
-                    hidden_size = config.hidden_size,
-                    intermediate_size = config.intermediate_size,
-                    key_up = "up_proj",
-                    key_gate = "gate_proj",
-                    key_down = "down_proj",
-                    qmap = "block.mlp",
-                    out_dtype = torch.float,
-                ),
+                mlp = (
+                    GatedMLP(
+                        config = config,
+                        key = f"model.layers.{idx}.mlp",
+                        hidden_size = config.hidden_size,
+                        intermediate_size = config.intermediate_size,
+                        key_up = "up_proj",
+                        key_gate = "gate_proj",
+                        key_down = "down_proj",
+                        qmap = "block.mlp",
+                        interm_dtype = torch.half,
+                        out_dtype = torch.float,
+                    )
+                    if idx < config.first_k_dense_replace else
+                    BlockSparseMLP(
+                        config = config,
+                        key = f"model.layers.{idx}.mlp",
+                        hidden_size = config.hidden_size,
+                        intermediate_size = config.moe_intermediate_size,
+                        num_experts = config.num_experts,
+                        num_experts_per_tok = config.num_experts_per_tok,
+                        key_up = "experts.{expert_idx}.up_proj",
+                        key_gate = "experts.{expert_idx}.gate_proj",
+                        key_down = "experts.{expert_idx}.down_proj",
+                        key_routing_gate = "gate",
+                        key_e_score_bias = "moe_statics.e_score_correction_bias",
+                        qmap = "block.mlp",
+                        interm_dtype = torch.float,
+                        out_dtype = torch.float,
+                        routed_scaling_factor = 1.0,
+                        n_group = 1,
+                        topk_group = 1,
+                        shared_experts = (
+                            GatedMLP(
+                                config = config,
+                                key = f"model.layers.{idx}.mlp.shared_experts",
+                                hidden_size = config.hidden_size,
+                                intermediate_size = config.moe_intermediate_size * config.num_shared_experts,
+                                key_up = "up_proj",
+                                key_gate = "gate_proj",
+                                key_down = "down_proj",
+                                qmap = "block.mlp",
+                                interm_dtype = torch.half,
+                                out_dtype = torch.float,
+                            )
+                            if config.num_shared_experts > 0 else
+                            None
+                        ),
+                    )
+                )
             )
             for idx in range(config.num_hidden_layers)
         ]
@@ -139,6 +184,9 @@ class LlamaModel(Model):
 
         self.logit_layer_idx = len(self.modules) - 1
 
+        # Activate all experts during H capture pass in quantization
+        self.calibration_all_experts = True
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
@@ -149,10 +197,9 @@ class LlamaModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        # Llama3 prompt
-        p = "<|begin_of_text|>"
+        p = "<|begin_of_sentence|>"
         if system_prompt:
-            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            p += f"{system_prompt}\n"
+        p += f"User: {prompt}\n"
+        p += f"Assistant: "
         return p

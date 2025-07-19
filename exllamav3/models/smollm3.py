@@ -7,18 +7,17 @@ from ..util.rope import RopeSettings, RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class LlamaConfig(Config):
-    arch_string = "LlamaForCausalLM"
+class SmolLM3Config(Config):
+    arch_string = "SmolLM3ForCausalLM"
 
     def __init__(
         self,
         directory: str,
-        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            derived_model if derived_model else {"text": LlamaModel},
+            {"text": SmolLM3Model},
             **kwargs
         )
 
@@ -31,6 +30,10 @@ class LlamaConfig(Config):
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
 
+        self.layer_types = self.read_cfg(list, "layer_types", None)
+        if self.layer_types:
+            assert all(x == "full_attention" for x in self.layer_types)
+
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
         self.intermediate_size = self.read_cfg(int, "intermediate_size", no_default)
@@ -40,18 +43,19 @@ class LlamaConfig(Config):
 
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
-        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
+        self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", True)
 
         # RoPE
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.no_rope_layers = self.read_cfg(list, "no_rope_layers", no_default)
 
 
-class LlamaModel(Model):
-    config_class = LlamaConfig
+class SmolLM3Model(Model):
+    config_class = SmolLM3Config
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: SmolLM3Config,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -84,13 +88,13 @@ class LlamaModel(Model):
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
                     num_kv_heads = config.num_kv_heads,
-                    rope_settings = config.rope_settings,
+                    rope_settings = config.rope_settings if config.no_rope_layers[idx] == 1 else None,
                     sm_scale = None,
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
+                    qmap = "block.attn"
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -106,6 +110,7 @@ class LlamaModel(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.mlp",
+                    interm_dtype = torch.half,
                     out_dtype = torch.float,
                 ),
             )
@@ -149,10 +154,11 @@ class LlamaModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        # Llama3 prompt
-        p = "<|begin_of_text|>"
+        p = ""
         if system_prompt:
-            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            p += f"<|im_start|>system\n"
+            p += f"{system_prompt}<|im_end|>\n"
+        p += f"<|im_start|>user\n"
+        p += f"{prompt}<|im_end|>\n"
+        p += f"<|im_start|>assistant\n"
         return p

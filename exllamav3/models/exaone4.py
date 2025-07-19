@@ -7,18 +7,17 @@ from ..util.rope import RopeSettings, RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class LlamaConfig(Config):
-    arch_string = "LlamaForCausalLM"
+class Exaone4Config(Config):
+    arch_string = "Exaone4ForCausalLM"
 
     def __init__(
         self,
         directory: str,
-        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            derived_model if derived_model else {"text": LlamaModel},
+            {"text": Exaone4Model},
             **kwargs
         )
 
@@ -30,6 +29,9 @@ class LlamaConfig(Config):
 
         if not self.head_dim:
             self.head_dim = self.hidden_size // self.num_q_heads
+
+        self.sliding_window = self.read_cfg(int, "sliding_window", -1)
+        self.sliding_window_pattern = self.read_cfg(str, "sliding_window_pattern", None)
 
         # MLP params
         self.assert_cfg(str, "hidden_act", "silu", True)
@@ -46,12 +48,12 @@ class LlamaConfig(Config):
         self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
 
 
-class LlamaModel(Model):
-    config_class = LlamaConfig
+class Exaone4Model(Model):
+    config_class = Exaone4Config
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: Exaone4Config,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -67,15 +69,18 @@ class LlamaModel(Model):
 
         self.first_block_idx = len(self.modules)
 
+        is_local = [
+            bool(
+                idx != config.num_hidden_layers - 1
+                and config.sliding_window_pattern[idx % len(config.sliding_window_pattern)] == "L"
+            )
+            for idx in range(config.num_hidden_layers)
+        ]
+
         self.modules += [
             TransformerBlock(
                 config = config,
                 key = f"model.layers.{idx}",
-                attn_norm = RMSNorm(
-                    config = config,
-                    key = f"model.layers.{idx}.input_layernorm",
-                    rms_norm_eps = config.rms_norm_eps,
-                ),
                 attn = Attention(
                     config = config,
                     key = f"model.layers.{idx}.self_attn",
@@ -84,15 +89,26 @@ class LlamaModel(Model):
                     head_dim = config.head_dim,
                     num_q_heads = config.num_q_heads,
                     num_kv_heads = config.num_kv_heads,
-                    rope_settings = config.rope_settings,
+                    rope_settings = config.rope_settings if is_local[idx] else None,
                     sm_scale = None,
+                    sliding_window = config.sliding_window if is_local[idx] else -1,
                     key_q = "q_proj",
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
                     qmap = "block.attn",
+                    q_norm = RMSNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.q_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
+                    k_norm = RMSNorm(
+                        config = config,
+                        key = f"model.layers.{idx}.self_attn.k_norm",
+                        rms_norm_eps = config.rms_norm_eps,
+                    ),
                 ),
-                mlp_norm = RMSNorm(
+                attn_post_norm = RMSNorm(
                     config = config,
                     key = f"model.layers.{idx}.post_attention_layernorm",
                     rms_norm_eps = config.rms_norm_eps,
@@ -106,7 +122,13 @@ class LlamaModel(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.mlp",
+                    interm_dtype = torch.half,
                     out_dtype = torch.float,
+                ),
+                mlp_post_norm = RMSNorm(
+                    config = config,
+                    key = f"model.layers.{idx}.post_feedforward_layernorm",
+                    rms_norm_eps = config.rms_norm_eps,
                 ),
             )
             for idx in range(config.num_hidden_layers)
@@ -149,10 +171,11 @@ class LlamaModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        # Llama3 prompt
-        p = "<|begin_of_text|>"
+        p = ""
         if system_prompt:
-            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            p += "[|system|]\n"
+            p += f"{system_prompt}[|endofturn|]\n"
+        p += f"[|user|]\n"
+        p += f"{prompt}[|endofturn|]\n"
+        p += f"[|assistant|]\n"
         return p

@@ -143,7 +143,7 @@ class Dots1Model(Model):
                         qmap = "block.mlp",
                         interm_dtype = torch.half,
                         out_dtype = torch.float,
-                        deepseekv3_routing = True,
+                        router_type = "dots",
                         routed_scaling_factor = config.routed_scaling_factor,
                         n_group = 1,
                         topk_group = 1,
@@ -210,9 +210,7 @@ class Dots1Model(Model):
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
         p = ""
         if system_prompt:
-            p += f"<|im_start|>system\n"
-            p += f"{system_prompt}<|im_end|>\n"
-        p += f"<|im_start|>user\n"
-        p += f"{prompt}<|im_end|>\n"
-        p += f"<|im_start|>assistant\n"
+            p += f"<|system|>{system_prompt}<|endofsystem|>"
+        p += f"<|userprompt|>{prompt}<|endofuserprompt|>"
+        p += f"<|response|>"
         return p

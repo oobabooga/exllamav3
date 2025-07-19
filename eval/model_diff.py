@@ -7,10 +7,27 @@ from exllamav3.util.progress import ProgressBar
 from exllamav3.util.memory import free_mem
 from exllamav3.util.measures import cosine_error, sqnr
 from exllamav3 import Config, Model, Tokenizer
+from exllamav3.loader import SafetensorsCollection, VariantSafetensorsCollection
 from datasets import load_dataset
 import torch
 import torch.nn.functional as F
 import math
+import yaml
+from safetensors.torch import save_file
+
+def save_tensor(tensor, path: str, tensor_name: str = None):
+    if isinstance(tensor, dict):
+        save_file({
+            k: v for k, v in tensor.items()
+        }, path)
+    elif isinstance(tensor, list):
+        save_file({
+            f"tensor.{i}": t for i, t in enumerate(tensor)
+        }, path)
+    else:
+        save_file({
+            tensor_name or f"tensor": tensor
+        }, path)
 
 
 @disk_lru_cache("get_dataset_text")
@@ -52,11 +69,37 @@ def main(args):
     config_b.override_dynamic_seq_len(2048)
     model_b = Model.from_config(config_b)
 
+    # Override tensors
+    if args.override:
+        with open(args.override, "r") as f:
+            comp = yaml.safe_load(f)
+        sources = {s["id"]: s["model_dir"] for s in comp["sources"]}
+        overrides = {o["key"]: sources[o["source"]] for o in comp["overrides"]}
+        collections = {}
+        for o_key, o_dir in overrides.items():
+            if o_dir not in collections:
+                collections[o_dir] = []
+            collections[o_dir].append(o_key)
+        if len(collections):
+            vstc = VariantSafetensorsCollection(config_a.stc)
+            for o_dir, o_keys in collections.items():
+                print(f" -- Overriding from: {o_dir}:")
+                for o_key in o_keys:
+                    print(f"      {o_key}")
+                vstc.add_stc(o_keys, SafetensorsCollection(o_dir))
+            config_a.stc = vstc
+
     # Dataset
     eval_ids = get_test_tokens(tokenizer, args.rows)
     state_a = eval_ids
     state_b = eval_ids
 
+    # Save input IDs
+    if args.save_input_ids:
+        print(f" -- Saving input IDs to: {args.save_input_ids}")
+        save_tensor(eval_ids, args.save_input_ids, "input_ids")
+
+    # Inference
     for idx, (module_a, module_b) in enumerate(zip(model_a.modules, model_b.modules)):
 
         config_a.stc.begin_deferred_load()
@@ -109,6 +152,14 @@ def main(args):
             f"   sqnr: {sqnr_:9.6f}"
             f"   cos_err: {cos_error:.6f}"
         )
+
+    # Save logits
+    if args.save_logits_a:
+        print(f" -- Saving model A logits to: {args.save_logits_a}")
+        save_tensor(state_a, args.save_logits_a, "logits")
+    if args.save_logits_b:
+        print(f" -- Saving model B logits to: {args.save_logits_b}")
+        save_tensor(state_b, args.save_logits_b, "logits")
 
     # Compare logits
     topk_max = args.topk_max
@@ -215,6 +266,9 @@ if __name__ == "__main__":
     parser.add_argument("-kb", "--keep_b", type = int, help = "Maintain B state for number of modules", default = 0)
     parser.add_argument("-tkm", "--topk_max", type = int, default = 5, help = "Max top-K interval to test")
     parser.add_argument("-d", "--device", type = int, help = "CUDA device index", default = 0)
-
+    parser.add_argument("-or", "--override", type = str, help = "Model A tensor override spec (YAML)", default = None)
+    parser.add_argument("-si", "--save_input_ids", type = str, help = "Save input IDs (filename)", default = None)
+    parser.add_argument("-sla", "--save_logits_a", type = str, help = "Save model A logits (filename)", default = None)
+    parser.add_argument("-slb", "--save_logits_b", type = str, help = "Save model B logits (filename)", default = None)
     _args = parser.parse_args()
     main(_args)

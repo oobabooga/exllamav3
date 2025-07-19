@@ -72,6 +72,7 @@ setup(
         "exllamav3",
         "exllamav3.generator",
         "exllamav3.generator.sampler",
+        "exllamav3.generator.filter",
         "exllamav3.conversion",
         "exllamav3.models",
         "exllamav3.modules",
@@ -90,7 +91,11 @@ setup(
         "rich",
         "typing_extensions",
         "ninja",
-        "safetensors>=0.3.2"
+        "safetensors>=0.3.2",
+        "pyyaml",
+        "marisa_trie",
+        "kbnf>=0.4.2",
+        "formatron>=0.5.0"
     ],
     include_package_data=True,
     package_data = {

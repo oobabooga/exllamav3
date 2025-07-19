@@ -7,18 +7,17 @@ from ..util.rope import RopeSettings, RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear
 from ..modules.attn import prepare_for_attn
 
-class LlamaConfig(Config):
-    arch_string = "LlamaForCausalLM"
+class Ernie4_5Config(Config):
+    arch_string = "Ernie4_5_ForCausalLM"
 
     def __init__(
         self,
         directory: str,
-        derived_model: dict | None = None,
         **kwargs,
     ):
         super().__init__(
             directory,
-            derived_model if derived_model else {"text": LlamaModel},
+            {"text": Ernie4_5Model},
             **kwargs
         )
 
@@ -43,15 +42,15 @@ class LlamaConfig(Config):
         self.tie_word_embeddings = self.read_cfg(bool, "tie_word_embeddings", False)
 
         # RoPE
-        self.rope_settings = self.read_rope_settings_default(RopeStyle.NEOX)
+        self.rope_settings = self.read_rope_settings_default(RopeStyle.GPTJ)
 
 
-class LlamaModel(Model):
-    config_class = LlamaConfig
+class Ernie4_5Model(Model):
+    config_class = Ernie4_5Config
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: Ernie4_5Config,
         **kwargs
     ):
         super().__init__(config, **kwargs)
@@ -90,7 +89,7 @@ class LlamaModel(Model):
                     key_k = "k_proj",
                     key_v = "v_proj",
                     key_o = "o_proj",
-                    qmap = "block.attn",
+                    qmap = "block.attn"
                 ),
                 mlp_norm = RMSNorm(
                     config = config,
@@ -106,6 +105,7 @@ class LlamaModel(Model):
                     key_gate = "gate_proj",
                     key_down = "down_proj",
                     qmap = "block.mlp",
+                    interm_dtype = torch.half,
                     out_dtype = torch.float,
                 ),
             )
@@ -149,10 +149,9 @@ class LlamaModel(Model):
 
     @override
     def default_chat_prompt(self, prompt: str, system_prompt: str = None) -> str:
-        # Llama3 prompt
-        p = "<|begin_of_text|>"
+        p = "<|begin_of_sentence|>"
         if system_prompt:
-            p += f"<|start_header_id|>system<|end_header_id|>\n\n{system_prompt}<|eot_id|>"
-        p += f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
-        p += f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+            p += f"{system_prompt}\n"
+        p += f"User: {prompt}\n"
+        p += f"Assistant: "
         return p

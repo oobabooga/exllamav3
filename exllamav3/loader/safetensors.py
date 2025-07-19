@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-
 import torch
 import os, glob
 import numpy as np
@@ -10,6 +8,7 @@ import mmap
 from ..util import Timer, cuda_sync_active
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
+from fnmatch import fnmatch
 
 MAX_DEFERRED_LOAD_CHUNK = 2*1024**2
 
@@ -185,16 +184,23 @@ class SafetensorsCollection:
         return bytesize
 
 
+    @lru_cache
+    def get_tensor_file_map_trie(self):
+        import marisa_trie
+        trie = marisa_trie.Trie(self.tensor_file_map.keys())
+        return trie
+
+
     def list_tensors(
         self,
         prefix: str,
         only_serializable: bool = False
     ) -> dict:
         assert self.new_tensors is None  # TODO
-        keys = [
-            key for key in self.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         results = {}
         for key in keys:
             filename = self.tensor_file_map[key]
@@ -219,10 +225,10 @@ class SafetensorsCollection:
         allow_bf16: bool = False,
     ) -> dict:
         assert self.new_tensors is None  # TODO
-        keys = [
-            key for key in self.tensor_file_map.keys()
-            if key == prefix or key.startswith(prefix + ".")
-        ]
+        keys = [self.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.get_tensor_file_map_trie().keys(prefix + ".")
         result = {key: self.get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
         return result
 
@@ -480,82 +486,155 @@ class SafetensorsCollection:
         self.deferred_loads = []
 
 
-class VariantSafetensorsCollection:
+    def find_stc(self, key):
+        return self
+
+
+# noinspection PyMissingConstructor
+class VariantSafetensorsCollection(SafetensorsCollection):
 
     def __init__(
         self,
-        tensor_map: dict[str, str],
+        main: SafetensorsCollection,
         **kwargs
     ):
-        self.tensor_map = None
-        self.tensor_map_sort = None
-        self.all_dirs = None
-        self.stcs = {}
-        self.kwargs = kwargs
-        self.update_map(tensor_map)
+        self.main = main
+        self.stcs = []
 
 
-    def update_map(
-        self,
-        tensor_map: dict[str, str]
-    ):
-        self.tensor_map = tensor_map
-        self.tensor_map_sort = sorted(tensor_map.items(), key = lambda kv: len(kv[0]), reverse = True)
-        all_dirs = list(set(tensor_map.values()))
+    def add_stc(self, filters, stc):
+        self.stcs = [(filters, stc)] + self.stcs
 
-        for d in all_dirs:
-            if d not in self.stcs:
-                self.stcs[d] = SafetensorsCollection(directory = d, **self.kwargs)
+
+    def find_stc(self, key):
+        for filters, stc in self.stcs:
+            for f in filters:
+                if fnmatch(key, f):
+                    return stc
+        return self.main
 
 
     def has_tensor(
         self,
         key: str,
     ):
-        return any(key in stc.tensor_file_map for stc in self.stcs.values())
+        stc = self.find_stc(key)
+        return stc.has_tensor(key)
 
 
     def has_tensor_group(
         self,
         key: str,
-        subkeys: list[str],
+        subkeys: list,
     ):
-        return all(
-            any(f"{key}.{subkey}" in stc.tensor_file_map for stc in self.stcs.values())
-            for subkey in subkeys
-        )
+        for subkey in subkeys:
+            sk_exists = False
+            for sk in [subkey] if isinstance(subkey, str) else subkey:
+                k = f"{key}.{sk}"
+                stc = self.find_stc(k)
+                if k in stc.tensor_file_map:
+                    sk_exists = True
+                    break
+            if not sk_exists:
+                return False
+        return True
+
+
+    def get_tensor_sizes(
+        self,
+        prefix: str,
+    ):
+        keys = [self.main.tensor_file_map.get(prefix)]
+        if keys[0] is None:
+            keys = []
+        keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
+        sizes = [self.get_tensor_size(key) for key in keys]
+        return sizes
+
+
+    def get_tensor_size(
+        self,
+        key: str,
+        optional: bool = False
+    ):
+        stc = self.find_stc(key)
+        return stc.get_tensor_size(key, optional)
+
+
+    def list_tensors(
+        self,
+        prefix: str,
+        only_serializable: bool = False
+    ) -> dict:
+        keys = [self.main.tensor_file_map.get(prefix)] or []
+        if keys[0] is None:
+            keys = []
+        keys += self.main.get_tensor_file_map_trie().keys(prefix + ".")
+        results = {}
+        for key in keys:
+            stc = self.find_stc(key)
+            filename = stc.tensor_file_map[key]
+            header = stc.file_headers[filename]
+            h = header[key]
+            dtype, np_dtype, esize = convert_dtype(h["dtype"])
+            beg, end = h["data_offsets"]
+            results[key] = {
+                "shape": h["shape"],
+                "n_bytes": end - beg,
+                "dtype": str(dtype)
+            }
+            if not only_serializable:
+                results[key]["torch_dtype"] = dtype
+        return results
+
+
+    def get_tensors(
+        self,
+        prefix: str,
+        device: torch.device | None = None,
+        allow_bf16: bool = False,
+    ) -> dict:
+        keys = [
+            key for key in self.main.tensor_file_map.keys()
+            if key == prefix or key.startswith(prefix + ".")
+        ]
+        result = {key: self.find_stc(key).get_tensor(key, device, allow_bf16 = allow_bf16) for key in keys}
+        return result
 
 
     def get_tensor(
         self,
         key: str,
-        device: torch.device | None = None,
-        optional: bool = False,
-        allow_bf16: bool = False
+        *args,
+        **kwargs,
     ) -> torch.Tensor | None:
-
-        file = None
-        for k, v in self.tensor_map_sort:
-            if key.startswith(k):
-                file = v
-                break
-        if file is None:
-            if not optional:
-                raise ValueError(f"No prefix found in variants map with the matching key: {key}")
-            else:
-                return None
-
-        return self.stcs[file].get_tensor(key, device, optional, allow_bf16)
+        stc = self.find_stc(key)
+        return stc.get_tensor(key, *args, **kwargs)
 
 
     def close(self):
-        for stc in self.stcs.values():
+        for stc in [s for _, s in self.stcs] + [self.main]:
             stc.close()
 
 
-    def get_metrics(self):
-        res = [stc.get_metrics() for stc in self.stcs.values()]
-        bytes_loaded = sum(r[0] for r in res)
-        time_elapsed = sum(r[1] for r in res)
-        bandwidth = bytes_loaded / (1024**3) / time_elapsed
-        return bytes_loaded, time_elapsed, bandwidth
+    def max_key_len(self):
+        return self.main.max_key_len()
+
+
+    def set_new_tensors(self, new_tensors):
+        raise NotImplementedError()
+
+
+    def begin_deferred_load(self):
+        for stc in [s for _, s in self.stcs] + [self.main]:
+            stc.begin_deferred_load()
+
+
+    def end_deferred_load(self):
+        for stc in [s for _, s in self.stcs] + [self.main]:
+            stc.end_deferred_load()
+
+
+    def abort_deferred_load(self):
+        for stc in [s for _, s in self.stcs] + [self.main]:
+            stc.abort_deferred_load()
