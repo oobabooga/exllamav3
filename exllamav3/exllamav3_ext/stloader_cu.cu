@@ -1,7 +1,7 @@
+#include <cuda_fp16.h>
 #include "stloader_cu.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
 #include "util.h"
 #include "util.cuh"
 
@@ -50,4 +50,5 @@ void inplace_bf16_to_fp16_cuda
 {
     size_t blocks = CEIL_DIVIDE(numel / 2, NUM_THREADS);
     inplace_bf16_to_fp16_kernel<<<blocks, NUM_THREADS>>>(buffer, numel / 2);
+    cuda_check(cudaPeekAtLastError());
 }

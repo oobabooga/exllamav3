@@ -80,19 +80,33 @@ if build_jit:
             else:
                 print(" !! Unable to find cl.exe; compilation will probably fail", file = sys.stderr)
 
-    # gcc / cl.exe flags
+    # compiler flags
+
+    extra_cflags = []
+    extra_cuda_cflags = ["-lineinfo", "-O3"]
 
     if windows:
-        extra_cflags = ["/Ox"]
+        extra_cflags += ["/Ox", "/arch:AVX2"]
+        extra_cuda_cflags += ["-Xcompiler", "/Ox", "-Xcompiler", "/arch:AVX2"]
+        # extra_cuda_cflags += [
+        #     "-gencode=arch=compute_80,code=sm_80",
+        #     "-gencode=arch=compute_86,code=sm_86",
+        #     "-gencode=arch=compute_89,code=sm_89",
+        #     "-gencode=arch=compute_89,code=compute_89",
+        #     "-gencode=arch=compute_90,code=sm_90",
+        #     "-gencode=arch=compute_100,code=sm_100",
+        #     "-gencode=arch=compute_120,code=sm_120",
+        #     "-gencode=arch=compute_120,code=compute_120",
+        # ]
+        if ext_debug:
+            extra_cflags += ["/Zi"]
+            extra_cuda_cflags += ["-Xcompiler", "/Zi"]
     else:
-        extra_cflags = ["-Ofast"]
-
-    if ext_debug:
-        extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
-
-    # nvcc flags
-
-    extra_cuda_cflags = ["-lineinfo", "-O3"]
+        extra_cflags += ["-Ofast", "-mavx2"]
+        extra_cuda_cflags += ["-Xcompiler=-O3", "-Xcompiler=-mavx2"]
+        if ext_debug:
+            extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
+            extra_cuda_cflags += ["-Xcompiler=-g"]
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]

@@ -1,7 +1,7 @@
+#include <cuda_fp16.h>
 #include "softcap.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
 #include "util.h"
 #include "util.cuh"
 
@@ -77,6 +77,7 @@ void softcap
             numel,
             scale
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else if (x.dtype() == at::kHalf)
     {
@@ -87,6 +88,7 @@ void softcap
             numel,
             scale
         );
+        cuda_check(cudaPeekAtLastError());
     }
     else
     {
